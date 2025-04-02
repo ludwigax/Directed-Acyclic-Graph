@@ -1,4 +1,3 @@
-import os
 import re
 import warnings
 from abc import ABC, abstractmethod
@@ -9,6 +8,7 @@ from dataclasses import dataclass
 import functools
 
 import inspect
+from .dbg import Debug, get_debug_state
 
 
 class Node(ABC):
@@ -81,7 +81,7 @@ def returns_keys(**kwargs):
     return decorator
 
 
-class Module(Node):
+class Module(Node, Debug):
     def __init__(
         self, 
         name: str = None, 
@@ -90,7 +90,8 @@ class Module(Node):
         outdirect = None,
         **kwargs
     ):
-        super().__init__(name, **kwargs)
+        Node.__init__(self, name, **kwargs)
+        Debug.__init__(self)
         self.parent = parent
 
         self.indirect = indirect
@@ -108,6 +109,11 @@ class Module(Node):
         return f"parent={self.parent}, prev={self._prev}, next={self._next}"
 
     def __call__(self, *args, **kwargs):
+        # Check if debugging is enabled
+        if get_debug_state():
+            self._start_timer()
+            
+        # Check for cached results
         if all(edge.is_cached for edges in self._next.values() if edges for edge in edges):
             results = {}
             for k, edges in self._next.items():
@@ -115,16 +121,27 @@ class Module(Node):
                     warnings.warn(f"Empty edge list found for key {k}", UserWarning)
                     continue
                 results[k] = edges[0].cache
+                
+            # Log time for cached execution if debugging is enabled
+            if get_debug_state():
+                elapsed = self._stop_timer()
+                print(f"[DEBUG] Module {self.name} returned cached result in {elapsed:.6f}s")
+                
             return results
 
+        # Prepare inputs
         self.prepare()
+        
+        # Execute forward computation
         forward_results = self.forward(**{k: edge.cache for k, edge in self._prev.items()})
         
+        # Process results
         if self.use_default_return and not isinstance(forward_results, dict):
             results = {"_return": forward_results}
         else:
             results = forward_results
 
+        # Update output edges
         for _next_k, res in results.items():
             if _next_k in self._next:
                 for _next_edge in self._next[_next_k]:
@@ -132,6 +149,12 @@ class Module(Node):
                     _next_edge.is_cached = True
             else:
                 warnings.warn(f"Output key {_next_k} not found in next edges", UserWarning)
+        
+        # Log execution time if debugging is enabled
+        if get_debug_state():
+            elapsed = self._stop_timer()
+            print(f"[DEBUG] Module {self.name} executed in {elapsed:.6f}s")
+            
         return results
     
     @property
@@ -320,7 +343,7 @@ class ModuleGroup(Module):
         self.indirect = len(self._prev)
         self.outdirect = len(self._next)
 
-    def forward(self, **kwargs):
+    def forward(self, **kwargs) -> Any:
         results = {}
 
         module_set = set()
@@ -336,8 +359,8 @@ class ModuleGroup(Module):
         return results
 
 def connect(
-        src: Union['Module', _PlaceholderNodeType], tgt: Union['Module', _PlaceholderNodeType], name: Optional[str] = None,
-        src_key: Optional[int] = None, tgt_key: Optional[int] = None
+        src: Union['Module', _PlaceholderNodeType], tgt: Union['Module', _PlaceholderNodeType],
+        src_key: Optional[int] = None, tgt_key: Optional[int] = None, name: Optional[str] = None
     ):
     name = name or f"{src_key} -> {tgt_key}"
     new_edge = Edge(name, src=src, src_key=src_key, tgt=tgt, tgt_key=tgt_key)
@@ -364,6 +387,26 @@ def connect(
         edge.tgt_key = None
 
         tgt._prev[tgt_key] = new_edge
+
+
+def get_module_stats(module: Module, recursive: bool = False) -> Dict[str, Any]:
+    stats = {module.name: module.get_stats()}
+    
+    if recursive and isinstance(module, ModuleGroup):
+        for name, submodule in module._modules.items():
+            substats = get_module_stats(submodule, recursive=True)
+            stats.update(substats)
+    
+    return stats
+
+def reset_module_stats(module: Module, recursive: bool = False) -> None:
+    module.reset_stats()
+    module.reset_stats()
+    
+    if recursive and isinstance(module, ModuleGroup):
+        for submodule in module._modules.values():
+            reset_module_stats(submodule, recursive=True)
+
 
 
 # custom module for example

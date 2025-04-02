@@ -1,9 +1,5 @@
-import matplotlib.pyplot as plt
-import numpy as np
-import os
-import sys
 from typing import Dict, Set, Tuple, List, Optional, Union, Any
-from utils import ensure_utf8_encoding
+from .utils import ensure_utf8_encoding
 
 ensure_utf8_encoding()
 
@@ -13,7 +9,7 @@ try:
 except ImportError:
     HAS_GRAPHVIZ = False
 
-from node import Node, Module, ModuleGroup, Edge, NullNode, VirtualNode
+from .node import Node, Module, ModuleGroup, Edge, NullNode, VirtualNode
 
 def check_graphviz_dependency():
     if not HAS_GRAPHVIZ:
@@ -33,15 +29,98 @@ def check_graphviz_dependency():
     
     return True
 
-def visualize_dag(endpoint: Module, output_file: str = None, format: str = 'png', view: bool = True):
+def group_visualize(group: ModuleGroup, dot: Digraph, processed_nodes: Set[int], 
+                   depth: int = 0, max_depth: int = 3, parent_group: Optional[ModuleGroup] = None):
     """
-    使用graphviz可视化计算图，从终端节点开始回溯构建整个图
+    可视化ModuleGroup的内部结构
     
     Args:
-        endpoint: 计算图的终端节点
-        output_file: 输出文件名（不包含扩展名）
-        format: 输出文件格式，如'png', 'pdf', 'svg'等
-        view: 是否立即显示图像
+        group: 要可视化的ModuleGroup
+        dot: 主Digraph对象
+        processed_nodes: 已处理节点的ID集合
+        depth: 当前深度
+        max_depth: 最大展开深度
+        parent_group: 父ModuleGroup（如果有）
+    """
+    if id(group) in processed_nodes:
+        return
+        
+    processed_nodes.add(id(group))
+    
+    # 创建子图
+    with dot.subgraph(name=f'cluster_{group.name}') as c:
+        c.attr(label=group.name, style='filled', color='lightgrey')
+        
+        # 处理内部模块
+        for module_name, module in group._modules.items():
+            if id(module) in processed_nodes:
+                continue
+                
+            processed_nodes.add(id(module))
+            
+            # 根据模块类型设置颜色
+            color = '#FFFFFF'  # 默认白色
+            if isinstance(module, ModuleGroup):
+                color = '#F0E68C'  # ModuleGroup使用淡黄色
+            
+            # 添加模块节点
+            c.node(module_name, 
+                   label=f"{module_name}\n{module.__class__.__name__}", 
+                   fillcolor=color)
+            
+            # 处理输入连接
+            for key, edge in module._prev.items():
+                if edge.null:
+                    # 未连接的输入
+                    input_name = f"{module_name}_in_{key}"
+                    c.node(input_name, 
+                           label=f"{key} (null)", 
+                           shape='diamond', 
+                           fillcolor='#FFD0D0')
+                    c.edge(input_name, module_name, style='dashed')
+                elif edge.virtual:
+                    # 虚连接
+                    if parent_group and key in parent_group._prev_name_map:
+                        map_key = parent_group._prev_name_map[key]
+                        if map_key.startswith(f"{group.name}."):
+                            # 内部映射
+                            inner_key = map_key.split('.')[1]
+                            c.edge(f"{module_name}_in_{inner_key}", module_name, 
+                                   style='dashed', color='blue')
+                else:
+                    # 正常连接
+                    src = edge.src
+                    if src is not NullNode and src is not VirtualNode:
+                        src_key = edge.src_key if edge.src_key else "output"
+                        c.edge(f"{src.name}_out_{src_key}", module_name, 
+                               label=f"{src_key} → {key}")
+            
+            # 处理输出连接
+            for key, edges in module._next.items():
+                if edges:
+                    output_name = f"{module_name}_out_{key}"
+                    c.node(output_name, 
+                           label=key, 
+                           shape='diamond', 
+                           fillcolor='#90EE90')
+                    c.edge(module_name, output_name)
+            
+            # 递归处理ModuleGroup
+            if isinstance(module, ModuleGroup) and depth < max_depth:
+                group_visualize(module, c, processed_nodes, depth + 1, max_depth, group)
+
+def dag_visualize(endpoint: Module, output_file: str = None, format: str = 'png', 
+                  view: bool = True, expand_groups: bool = False, max_depth: int = 3):
+    """
+    可视化整个DAG结构
+    
+    Args:
+        endpoint: 终端节点
+        output_file: 输出文件名
+        format: 输出格式
+        view: 是否立即显示
+        expand_groups: 是否展开ModuleGroup
+        max_depth: 最大展开深度
     """
     if not check_graphviz_dependency():
         print("可视化已中止。请安装必需的依赖。")
@@ -54,78 +133,67 @@ def visualize_dag(endpoint: Module, output_file: str = None, format: str = 'png'
         
         processed_nodes = set()
         
-        def add_node_to_graph(node: Module, parent_group: Optional[ModuleGroup] = None):
+        def add_node(node: Module, parent_group: Optional[ModuleGroup] = None):
             if id(node) in processed_nodes:
                 return
-            
+                
             processed_nodes.add(id(node))
-            color = '#FFFFFF'  # 默认白色
-            if isinstance(node, ModuleGroup):
-                color = '#F0E68C'  # 模块组使用淡黄色
-            elif node == endpoint:
-                color = '#90EE90'  # 终端节点使用淡绿色
             
-            # 添加节点到图中
+            # 设置节点颜色
+            color = '#FFFFFF'
+            if isinstance(node, ModuleGroup):
+                color = '#F0E68C'
+            elif node == endpoint:
+                color = '#90EE90'
+            
+            # 添加节点
             node_label = f"{node.name}\n{node.__class__.__name__}"
             dot.node(node.name, label=node_label, fillcolor=color)
             
-            # 处理节点的输入边
+            # 处理输入连接
             for key, edge in node._prev.items():
                 if edge.null:
-                    # 未连接的输入边
-                    dot.node(f"{node.name}_{key}_input", 
-                            label=f"{key} (null)",
-                            shape='ellipse',
-                            fillcolor='#FFD0D0')  # 淡红色
-                    dot.edge(f"{node.name}_{key}_input", node.name, 
-                            label=key, 
-                            style='dashed')
+                    # 未连接的输入
+                    input_name = f"{node.name}_in_{key}"
+                    dot.node(input_name, 
+                            label=f"{key} (null)", 
+                            shape='diamond', 
+                            fillcolor='#FFD0D0')
+                    dot.edge(input_name, node.name, style='dashed')
                 elif edge.virtual and parent_group:
-                    # 虚拟边（通过ModuleGroup连接）
+                    # 虚连接
                     map_key = next((k for k, v in parent_group._prev_name_map.items() 
                                 if v == f"{node.name}.{key}"), None)
                     if map_key:
                         virtual_src = parent_group._prev[map_key].src
-                        if virtual_src is not NullNode:
-                            # 真实连接的边
-                            add_node_to_graph(virtual_src)
+                        if virtual_src is not NullNode and virtual_src is not VirtualNode:
+                            add_node(virtual_src)
                             src_key = parent_group._prev[map_key].src_key
                             dot.edge(virtual_src.name, node.name, 
                                     label=f"{src_key} → {key}",
                                     color='blue')
                 else:
-                    # 正常连接的边
+                    # 正常连接
                     src = edge.src
                     if src is not NullNode and src is not VirtualNode:
-                        add_node_to_graph(src)
-                        src_key_label = edge.src_key if edge.src_key else "output"
+                        add_node(src)
+                        src_key = edge.src_key if edge.src_key else "output"
                         dot.edge(src.name, node.name, 
-                                label=f"{src_key_label} → {key}")
+                                label=f"{src_key} → {key}")
             
-            # 如果是ModuleGroup，处理其内部模块
+            # 处理ModuleGroup
             if isinstance(node, ModuleGroup):
-                # 子图表示ModuleGroup
-                with dot.subgraph(name=f'cluster_{node.name}') as c:
-                    c.attr(label=node.name, style='filled', color='lightgrey')
-                    
-                    # 添加所有内部模块
+                if expand_groups:
+                    # 展开ModuleGroup
+                    group_visualize(node, dot, processed_nodes, 0, max_depth, parent_group)
+                else:
+                    # 作为单个节点处理
                     for module_name, module in node._modules.items():
                         if id(module) not in processed_nodes:
-                            # 递归处理模块
-                            add_node_to_graph(module, node)
-                            
-                    # 处理内部连接
-                    for module_name, module in node._modules.items():
-                        for key, edge in module._prev.items():
-                            if not edge.virtual and edge.src is not NullNode and edge.src is not VirtualNode:
-                                if hasattr(edge.src, 'name') and edge.src.name in node._modules:
-                                    # 内部连接
-                                    src_key_label = edge.src_key if edge.src_key else "output"
-                                    edge_label = f"{src_key_label} → {key}"
-                                    dot.edge(edge.src.name, module.name, label=edge_label, color='red')
+                            add_node(module, node)
         
         # 从终端节点开始构建图
-        add_node_to_graph(endpoint)
+        add_node(endpoint)
         
         # 检查ModuleGroup终端节点的输出情况
         if isinstance(endpoint, ModuleGroup):

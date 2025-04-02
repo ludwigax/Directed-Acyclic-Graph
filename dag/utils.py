@@ -5,9 +5,7 @@ import importlib
 import copy
 from typing import Dict, List, Tuple, Any, Union, Optional, Type
 
-from node import Module, Node, connect, ModuleGroup, NullNode, VirtualNode
-from view import visualize_dag, text_visualize_dag
-
+from .node import Module, Node, connect, ModuleGroup, NullNode, VirtualNode
 
 def ensure_utf8_encoding():
     try:
@@ -572,32 +570,6 @@ def run_dag_from_dict(dag_dict: Dict[str, Any], endpoint_name: str):
     
     print(f"计算结果: {result}")
     return result, endpoint
-
-# 实用函数：从字典创建并可视化DAG
-def visualize_dag_from_dict(dag_dict: Dict[str, Any], endpoint_name: str, output_file: str = None, use_text: bool = False):
-    """
-    从字典创建并可视化DAG
-    
-    Args:
-        dag_dict: DAG字典
-        endpoint_name: 终端节点的名称
-        output_file: 输出文件名（不包含扩展名）
-        use_text: 是否使用文本模式可视化
-    """
-    ensure_utf8_encoding()
-    modules = build_dag_from_dict(dag_dict)
-    
-    if endpoint_name not in modules:
-        raise ValueError(f"终端节点不存在: {endpoint_name}")
-    
-    endpoint = modules[endpoint_name]
-    
-    if use_text:
-        text_visualize_dag(endpoint)
-    else:
-        visualize_dag(endpoint, output_file=output_file)
-    
-    return endpoint
 
 # 示例函数: 从模板创建和运行DAG
 def run_dag_from_templates(templates: Dict[str, Dict[str, Any]], endpoint_name: str):
