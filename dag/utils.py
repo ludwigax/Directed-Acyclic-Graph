@@ -17,7 +17,7 @@ def ensure_utf8_encoding():
         import io
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
-    print("编码已设置为UTF-8")
+    print("Encoding set to UTF-8")
 
 
 def build_dag_from_dict(dag_dict: Dict[str, Any], module_registry: Optional[Dict[str, Type[Module]]] = None) -> Dict[str, Module]:

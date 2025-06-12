@@ -1,6 +1,7 @@
 from .node import (
-    Module, InspectModule, FunctionModule, ModuleGroup,
+    Module, InspectModule, FunctionModule, ModuleGroup, Constant, NullNode, VirtualNode,
     connect, returns_keys, reset_module_stats, get_module_stats
 )
 from .view import dag_visualize
 from .dbg import DebuggingContext, set_debug_state, get_debug_state
+from .inspect_utils import inspect_module, inspect_module_tree, print_module

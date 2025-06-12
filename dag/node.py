@@ -42,6 +42,7 @@ class _PlaceholderNodeType:
     def __repr__(self):
         return f"<{self._name}>"
 
+
 NullNode = _PlaceholderNodeType("NullNode")
 VirtualNode = _PlaceholderNodeType("VirtualNode")
 
@@ -53,11 +54,12 @@ class Edge:
     tgt: Union['Node', _PlaceholderNodeType] = NullNode
     src_key: Optional[str] = None
     tgt_key: Optional[str] = None
+    is_active: bool = True
     is_cached: bool = False
     _cache: Optional[Any] = None
 
     def __repr__(self):
-        return f"{self.__class__.__name__}({self.name}, src={self.src}, tgt={self.tgt}, cache={type(self._cache)}, is_cached={self.is_cached})"
+        return f"{self.__class__.__name__}({self.name}, src={self.src}, tgt={self.tgt}, cache={type(self._cache)}, is_cached={self.is_cached}, is_active={self.is_active})"
 
     @property
     def null(self):
@@ -70,6 +72,13 @@ class Edge:
     @property
     def cache(self):
         return self._cache
+
+    def __call__(self, force: bool = False):
+        if self.is_active or force:
+            return self.cache
+        else:
+            return None
+
     
 def returns_keys(**kwargs):
     def decorator(func):
@@ -99,6 +108,7 @@ class Module(Node, Debug):
 
         self._prev: Dict[str, Edge] = {}
         self._next: Dict[str, List[Edge]] = defaultdict(list)
+        self._default_values: Dict[str, Any] = {}
 
         self.use_default_return = True
 
@@ -107,6 +117,66 @@ class Module(Node, Debug):
     
     def extra_repr(self):
         return f"parent={self.parent}, prev={self._prev}, next={self._next}"
+
+    @staticmethod
+    def infer_input_parameters(func: Callable) -> Tuple[List[str], Dict[str, Any]]:
+        """
+        Infer input parameters from a callable function.
+        
+        Args:
+            func: The callable function to inspect
+            
+        Returns:
+            Tuple of (parameter_names, default_values)
+            - parameter_names: List of parameter names (excluding self, *args, **kwargs)
+            - default_values: Dict mapping parameter names to their default values
+        """
+        func_signature = inspect.signature(func)
+        parameters = list(func_signature.parameters.keys())
+        
+        # Remove 'self' parameter if present
+        if parameters and parameters[0] == 'self':
+            parameters = parameters[1:]
+
+        # Filter out *args and **kwargs parameters, collect defaults
+        filtered_parameters = []
+        default_values = {}
+        
+        for param in parameters:
+            param_obj = func_signature.parameters[param]
+            param_kind = param_obj.kind
+            
+            if (param_kind != inspect.Parameter.VAR_POSITIONAL and 
+                param_kind != inspect.Parameter.VAR_KEYWORD):
+                filtered_parameters.append(param)
+                
+                # Check if parameter has a default value
+                if param_obj.default != inspect.Parameter.empty:
+                    default_values[param] = param_obj.default
+        
+        return filtered_parameters, default_values
+
+    @staticmethod
+    def infer_output_keys(func: Callable) -> Tuple[List[str], bool]:
+        """
+        Infer output keys from a callable function.
+        
+        Args:
+            func: The callable function to inspect
+            
+        Returns:
+            Tuple of (output_keys, use_default_return)
+            - output_keys: List of output key names
+            - use_default_return: Whether to use default return behavior
+        """
+        output_keys = ["_return"]
+        use_default_return = True
+        
+        if hasattr(func, '__returns_keys__'):
+            output_keys = list(func.__returns_keys__.keys())
+            use_default_return = False
+            
+        return output_keys, use_default_return
 
     def __call__(self, *args, **kwargs):
         # Check if debugging is enabled
@@ -120,7 +190,7 @@ class Module(Node, Debug):
                 if not edges:
                     warnings.warn(f"Empty edge list found for key {k}", UserWarning)
                     continue
-                results[k] = edges[0].cache
+                results[k] = edges[0].__call__()
                 
             # Log time for cached execution if debugging is enabled
             if get_debug_state():
@@ -133,7 +203,14 @@ class Module(Node, Debug):
         self.prepare()
         
         # Execute forward computation
-        forward_results = self.forward(**{k: edge.cache for k, edge in self._prev.items()})
+        forward_kwargs = {}
+        for k, edge in self._prev.items():
+            if edge.is_cached and edge.is_active:
+                forward_kwargs[k] = edge.__call__()
+            elif k in self._default_values:
+                forward_kwargs[k] = self._default_values[k]
+        
+        forward_results = self.forward(**forward_kwargs)
         
         # Process results
         if self.use_default_return and not isinstance(forward_results, dict):
@@ -168,11 +245,20 @@ class Module(Node, Debug):
     def prepare(self):
         for _prev_k, prev_edge in self._prev.items():
             if prev_edge.null:
-                raise ValueError(f"Undefined input: {prev_edge.name}")
+                # Check if parameter has default value or edge is inactive
+                if _prev_k in self._default_values or not prev_edge.is_active:
+                    continue  # Skip error for parameters with defaults or inactive edges
+                else:
+                    raise ValueError(f"Undefined input: {prev_edge.name}")
             if prev_edge.virtual:
-                map_key = next(k for k, v in self.parent._prev_name_map.items() if v == f"{self.name}.{_prev_k}")
-                prev_edge._cache = self.parent._prev[map_key].cache
-                prev_edge.is_cached = True
+                # Find the mapping using new tuple format
+                for group_key, (module_name, module_key) in self.parent._prev_name_map.items():
+                    if (module_name, module_key) == (self.name, _prev_k):
+                        prev_edge._cache = self.parent._prev[group_key].cache
+                        prev_edge.is_cached = True
+                        break
+                else:
+                    raise RuntimeError(f"Virtual edge mapping not found for {self.name}.{_prev_k}")
             else:
                 prev_edge.src()
 
@@ -195,29 +281,26 @@ class FunctionModule(Module):
         self.func = func
         self.func_signature = inspect.signature(func)
 
-        parameters = list(self.func_signature.parameters.keys())
-        
-        if parameters and parameters[0] == 'self':
-            parameters = parameters[1:]
-
-        filtered_parameters = []
-        for param in parameters:
-            param_kind = self.func_signature.parameters[param].kind
-            if param_kind != inspect.Parameter.VAR_POSITIONAL and param_kind != inspect.Parameter.VAR_KEYWORD:
-                filtered_parameters.append(param)
+        # Use static methods for inference
+        filtered_parameters, default_values = self.infer_input_parameters(func)
+        output_keys, use_default_return = self.infer_output_keys(func)
         
         indirect = len(filtered_parameters)
+        outdirect = len(output_keys)
 
-        output_keys = ["_return"]
+        super().__init__(name=name, parent=parent, indirect=indirect, outdirect=outdirect, **kwargs)
         
-        if hasattr(func, '__returns_keys__'):
-            output_keys = list(func.__returns_keys__.keys())
-            self.use_default_return = False
+        # Set use_default_return based on inference
+        self.use_default_return = use_default_return
 
-        super().__init__(name=name, parent=parent, indirect=indirect, outdirect=len(output_keys), **kwargs)
+        # Set default values
+        self._default_values = default_values
 
+        # Initialize input edges
         for param in filtered_parameters:
             self._prev[param] = Edge(name=param)
+        
+        # Initialize output edges
         for output in output_keys:
             self._next[output] = [Edge(name=output)]
 
@@ -237,30 +320,24 @@ class InspectModule(Module):
     def __init__(self, name: str = None, parent: Optional['Module'] = None, **kwargs):
         super().__init__(name, parent, **kwargs)
         
-        forward_method = self.forward
-        self.forward_signature = inspect.signature(forward_method)
-        parameters = list(self.forward_signature.parameters.keys())
-        
-        if parameters and parameters[0] == 'self':
-            parameters = parameters[1:]
-
-        filtered_parameters = []
-        for param in parameters:
-            param_kind = self.forward_signature.parameters[param].kind
-            if param_kind != inspect.Parameter.VAR_POSITIONAL and param_kind != inspect.Parameter.VAR_KEYWORD:
-                filtered_parameters.append(param)
+        # Use static methods for inference
+        filtered_parameters, default_values = self.infer_input_parameters(self.forward)
+        output_keys, use_default_return = self.infer_output_keys(self.forward)
         
         self.indirect = len(filtered_parameters)
+        self.outdirect = len(output_keys)
+        
+        # Set use_default_return based on inference
+        self.use_default_return = use_default_return
 
+        # Set default values
+        self._default_values = default_values
+
+        # Initialize input edges
         for param in filtered_parameters:
             self._prev[param] = Edge(name=param)
         
-        output_keys = ["_return"]
-        
-        if hasattr(forward_method, '__returns_keys__'):
-            output_keys = list(forward_method.__returns_keys__.keys())
-            self.use_default_return = False
-        
+        # Initialize output edges
         for key in output_keys:
             self._next[key] = [Edge(name=key)]
 
@@ -292,27 +369,35 @@ class ModuleGroup(Module):
                 # warnings.warn(f"Module with name {module.name} already exists in the group.", UserWarning)
             self._modules[module.name] = module
     
-        prev_key_repeat = defaultdict(set)
-        next_key_repeat = defaultdict(set)
+        # Track key usage for consistent naming
+        prev_key_counter = defaultdict(int)
+        next_key_counter = defaultdict(int)
 
         for _, module in self._modules.items():
+            # Validate module name doesn't contain separator
+            if '.' in module.name:
+                raise ValueError(f"Module name '{module.name}' cannot contain '.' character as it's used as separator in mapping")
+            
             for key, edge in module._prev.items():
                 if edge.null:
-                    if key in prev_key_repeat:
-                        idx = max([x for x in prev_key_repeat[key] if isinstance(x, int)], default=1)
-                        group_key = f"{key}_{idx + 1}"
-                        prev_key_repeat[key].add(idx + 1)
-                    else:
+                    prev_key_counter[key] += 1
+                    
+                    # Generate consistent group key name
+                    if prev_key_counter[key] == 1:
                         group_key = key
-                        prev_key_repeat[key].add(1)
-
-                    self._prev_name_map[group_key] = f"{module.name}.{key}"
-
-                    if group_key not in self._prev:
-                        self._prev[group_key] = Edge(name=group_key, tgt=self)
                     else:
-                        warnings.warn(f"Duplicate _prev_key {group_key} found in module {module.name}.", UserWarning)
+                        group_key = f"{key}_{prev_key_counter[key]}"
 
+                    # Create mapping using tuple for robustness
+                    self._prev_name_map[group_key] = (module.name, key)
+
+                    # Create group input edge
+                    if group_key in self._prev:
+                        raise RuntimeError(f"Internal error: duplicate group key '{group_key}' should not occur with correct naming logic")
+                    
+                    self._prev[group_key] = Edge(name=group_key, tgt=self)
+
+                    # Set module edge to virtual
                     module._prev[key] = Edge(
                         name=key,
                         src=VirtualNode,
@@ -323,20 +408,24 @@ class ModuleGroup(Module):
             for key, edges in module._next.items():
                 for idx, edge in enumerate(edges):
                     if edge.null:
-                        if key in next_key_repeat:
-                            idx = max([x for x in next_key_repeat[key] if isinstance(x, int)], default=1)
-                            group_key = f"{key}_{idx + 1}"
-                            next_key_repeat[key].add(idx + 1)
-                        else:
+                        next_key_counter[key] += 1
+                        
+                        # Generate consistent group key name
+                        if next_key_counter[key] == 1:
                             group_key = key
-                            next_key_repeat[key].add(1)
-
-                        self._next_name_map[group_key] = f"{module.name}.{key}"
-                        if group_key not in self._next:
-                            self._next[group_key] = [Edge(name=group_key, src=self, src_key=group_key)]
                         else:
-                            warnings.warn(f"Duplicate _next_key {group_key} found in module {module.name}.", UserWarning)
+                            group_key = f"{key}_{next_key_counter[key]}"
 
+                        # Create mapping using tuple for robustness
+                        self._next_name_map[group_key] = (module.name, key)
+                        
+                        # Create group output edge
+                        if group_key in self._next:
+                            raise RuntimeError(f"Internal error: duplicate group key '{group_key}' should not occur with correct naming logic")
+                            
+                        self._next[group_key] = [Edge(name=group_key, src=self, src_key=group_key)]
+
+                        # Set module edge to virtual
                         module._next[key][idx].tgt = VirtualNode
                         break
         
@@ -347,20 +436,20 @@ class ModuleGroup(Module):
         results = {}
 
         module_set = set()
-        for map_key, module_key in self._next_name_map.items():
-            module_name = module_key.split(".")[0]
+        for map_key, (module_name, module_key) in self._next_name_map.items():
             module_set.add(module_name)
         
         for module_name in module_set:
             self._modules[module_name]()
 
         for key, edges in self._next.items():
-            results[key] = self._modules[self._next_name_map[key].split(".")[0]]._next[key][0].cache
+            module_name, module_key = self._next_name_map[key]
+            results[key] = self._modules[module_name]._next[module_key][0].cache
         return results
 
 def connect(
         src: Union['Module', _PlaceholderNodeType], tgt: Union['Module', _PlaceholderNodeType],
-        src_key: Optional[int] = None, tgt_key: Optional[int] = None, name: Optional[str] = None
+        src_key: Optional[str] = None, tgt_key: Optional[str] = None, name: Optional[str] = None
     ):
     name = name or f"{src_key} -> {tgt_key}"
     new_edge = Edge(name, src=src, src_key=src_key, tgt=tgt, tgt_key=tgt_key)
