@@ -369,9 +369,44 @@ class ModuleGroup(Module):
                 # warnings.warn(f"Module with name {module.name} already exists in the group.", UserWarning)
             self._modules[module.name] = module
     
-        # Track key usage for consistent naming
-        prev_key_counter = defaultdict(int)
-        next_key_counter = defaultdict(int)
+        def parse_key(key: str) -> Tuple[str, int]:
+            if '.' in key:
+                parts = key.split('.')
+                try:
+                    return parts[0], int(parts[1])
+                except (ValueError, IndexError):
+                    return key, 1
+            return key, 1
+        
+        def create_key_generators(keys: List[str]) -> Dict[str, Callable[[], str]]:
+            root_groups = defaultdict(list)
+            for key in keys:
+                root, num = parse_key(key)
+                root_groups[root].append((key, num))
+            
+            key_generators = {}
+            for root, key_list in root_groups.items():
+                if len(key_list) == 1:
+                    key_generators[root] = lambda r=root: r
+                else:
+                    def make_generator(root_name):
+                        counter = 1
+                        def generator():
+                            nonlocal counter
+                            if counter == 1:
+                                result = root_name
+                            else:
+                                result = f"{root_name}.{counter}"
+                            counter += 1
+                            return result
+                        return generator
+                    key_generators[root] = make_generator(root)
+            
+            return key_generators
+
+        # Collect all keys that need group-level mapping
+        prev_keys_to_process = []
+        next_keys_to_process = []
 
         for _, module in self._modules.items():
             # Validate module name doesn't contain separator
@@ -380,13 +415,24 @@ class ModuleGroup(Module):
             
             for key, edge in module._prev.items():
                 if edge.null:
-                    prev_key_counter[key] += 1
-                    
-                    # Generate consistent group key name
-                    if prev_key_counter[key] == 1:
-                        group_key = key
-                    else:
-                        group_key = f"{key}_{prev_key_counter[key]}"
+                    prev_keys_to_process.append(key)
+
+            for key, edges in module._next.items():
+                for edge in edges:
+                    if edge.null:
+                        next_keys_to_process.append(key)
+                        break  # Only count once per key
+
+        # Create key generators to avoid conflicts
+        prev_key_generators = create_key_generators(prev_keys_to_process)
+        next_key_generators = create_key_generators(next_keys_to_process)
+
+        # Apply the reassigned keys
+        for _, module in self._modules.items():
+            for key, edge in module._prev.items():
+                if edge.null:
+                    root, _ = parse_key(key)
+                    group_key = prev_key_generators[root]()
 
                     # Create mapping using tuple for robustness
                     self._prev_name_map[group_key] = (module.name, key)
@@ -405,16 +451,15 @@ class ModuleGroup(Module):
                         tgt_key=key
                     )
 
+                    # Handle default values if they exist
+                    if key in module._default_values:
+                        self._default_values[group_key] = module._default_values[key]
+
             for key, edges in module._next.items():
                 for idx, edge in enumerate(edges):
                     if edge.null:
-                        next_key_counter[key] += 1
-                        
-                        # Generate consistent group key name
-                        if next_key_counter[key] == 1:
-                            group_key = key
-                        else:
-                            group_key = f"{key}_{next_key_counter[key]}"
+                        root, _ = parse_key(key)
+                        group_key = next_key_generators[root]()
 
                         # Create mapping using tuple for robustness
                         self._next_name_map[group_key] = (module.name, key)
@@ -426,7 +471,12 @@ class ModuleGroup(Module):
                         self._next[group_key] = [Edge(name=group_key, src=self, src_key=group_key)]
 
                         # Set module edge to virtual
-                        module._next[key][idx].tgt = VirtualNode
+                        module._next[key][idx] = Edge(
+                            name=key,
+                            src=module,
+                            tgt=VirtualNode,
+                            src_key=key,
+                        )
                         break
         
         self.indirect = len(self._prev)
@@ -448,9 +498,25 @@ class ModuleGroup(Module):
         return results
 
 def connect(
-        src: Union['Module', _PlaceholderNodeType], tgt: Union['Module', _PlaceholderNodeType],
-        src_key: Optional[str] = None, tgt_key: Optional[str] = None, name: Optional[str] = None
-    ):
+    src: Union['Module', _PlaceholderNodeType] = NullNode, 
+    src_key: Optional[str] = None, 
+    tgt: Union['Module', _PlaceholderNodeType] = NullNode, 
+    tgt_key: Optional[str] = None,
+    name: Optional[str] = None
+):
+    if src is NullNode and tgt is NullNode:
+        raise ValueError("Both source and target are NullNodes")
+
+    # Validate src_key exists in source module
+    if hasattr(src, "_next") and src_key is not None:
+        if src_key not in src._next:
+            raise ValueError(f"Source key '{src_key}' not found in module '{src.name}'")
+    
+    # Validate tgt_key exists in target module
+    if hasattr(tgt, "_prev") and tgt_key is not None:
+        if tgt_key not in tgt._prev:
+            raise ValueError(f"Target key '{tgt_key}' not found in module '{tgt.name}'")
+    
     name = name or f"{src_key} -> {tgt_key}"
     new_edge = Edge(name, src=src, src_key=src_key, tgt=tgt, tgt_key=tgt_key)
 
@@ -476,6 +542,23 @@ def connect(
         edge.tgt_key = None
 
         tgt._prev[tgt_key] = new_edge
+
+
+def clear_cache(module: Module):
+    if not module._prev is None:
+        for edge in module._prev.values():
+            edge.is_cached = False
+            edge._cache = None
+
+    if not module._next is None:
+        for edges in module._next.values():
+            for edge in edges:
+                edge.is_cached = False
+                edge._cache = None
+    
+    if isinstance(module, ModuleGroup):
+        for child in module._modules.values():
+            clear_cache(child)
 
 
 def get_module_stats(module: Module, recursive: bool = False) -> Dict[str, Any]:

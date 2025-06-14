@@ -1,0 +1,745 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DAG Interactive Visualizer</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        
+        .container {
+            width: 100%;
+            margin: 0 auto;
+            background-color: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            overflow: visible;
+        }
+        
+        .header {
+            background-color: #2c3e50;
+            color: white;
+            padding: 20px;
+            text-align: center;
+        }
+        
+        .header h1 {
+            margin: 0;
+            font-size: 2em;
+        }
+        
+        .controls {
+            padding: 20px;
+            border-bottom: 1px solid #eee;
+            background-color: #f8f9fa;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            align-items: center;
+        }
+        
+        .btn {
+            background-color: #3498db;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: background-color 0.3s;
+        }
+        
+        .btn:hover {
+            background-color: #2980b9;
+        }
+        
+        .btn:disabled {
+            background-color: #bdc3c7;
+            cursor: not-allowed;
+        }
+        
+        .btn-execute {
+            background-color: #27ae60;
+        }
+        
+        .btn-execute:hover {
+            background-color: #229954;
+        }
+        
+        .btn-refresh-status {
+            background-color: #f39c12;
+        }
+        
+        .btn-refresh-status:hover {
+            background-color: #e67e22;
+        }
+        
+        .btn-clear-cache {
+            background-color: #e74c3c;
+        }
+        
+        .btn-clear-cache:hover {
+            background-color: #c0392b;
+        }
+        
+        .status {
+            margin-top: 10px;
+            padding: 10px;
+            border-radius: 4px;
+            display: none;
+        }
+        
+        .status.success {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        
+        .status.error {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        
+        .status.warning {
+            background-color: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeaa7;
+        }
+        
+        .main-content {
+            display: flex;
+            gap: 20px;
+        }
+        
+        .plot-section {
+            flex: 2;
+            min-width: 0;
+        }
+        
+        .plot-container {
+            min-height: 600px;
+            width: 100%;
+            position: relative;
+            overflow: auto;
+        }
+        
+        .results-section {
+            flex: 1;
+            min-width: 300px;
+            border-left: 1px solid #eee;
+            padding: 20px;
+            background-color: #f8f9fa;
+        }
+        
+        .results-header {
+            font-size: 18px;
+            font-weight: bold;
+            margin-bottom: 15px;
+            color: #2c3e50;
+        }
+        
+        .results-content {
+            background-color: white;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            padding: 15px;
+            max-height: 400px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            line-height: 1.4;
+        }
+        
+        .execution-info {
+            background-color: #e8f5e8;
+            border: 1px solid #c3e6cb;
+            border-radius: 4px;
+            padding: 10px;
+            margin-bottom: 10px;
+        }
+        
+        .execution-info h4 {
+            margin: 0 0 5px 0;
+            color: #155724;
+        }
+        
+        .edge-status-section {
+            margin-top: 20px;
+        }
+        
+        .edge-status-header {
+            font-size: 16px;
+            font-weight: bold;
+            margin-bottom: 10px;
+            color: #2c3e50;
+        }
+        
+        .edge-status-list {
+            background-color: white;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+        
+        .edge-status-item {
+            padding: 8px 12px;
+            border-bottom: 1px solid #eee;
+            font-size: 12px;
+        }
+        
+        .edge-status-item:last-child {
+            border-bottom: none;
+        }
+        
+        .edge-cached {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        
+        .edge-active {
+            background-color: #cce5ff;
+            color: #004085;
+        }
+        
+        .edge-inactive {
+            background-color: #f8f9fa;
+            color: #6c757d;
+        }
+        
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 40px;
+            color: #666;
+        }
+        
+        .legend {
+            padding: 15px 20px;
+            background-color: #f8f9fa;
+            border-top: 1px solid #eee;
+            font-size: 14px;
+            color: #666;
+        }
+        
+        .legend-item {
+            display: inline-block;
+            margin-right: 20px;
+            margin-bottom: 5px;
+        }
+        
+        .legend-color {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-right: 5px;
+            vertical-align: middle;
+        }
+        
+        .breadcrumb {
+            padding: 10px 20px;
+            background-color: #e9ecef;
+            border-bottom: 1px solid #dee2e6;
+            font-size: 14px;
+        }
+        
+        .breadcrumb-item {
+            display: inline-block;
+            color: #6c757d;
+        }
+        
+        .breadcrumb-item.active {
+            color: #495057;
+            font-weight: bold;
+        }
+        
+        .breadcrumb-separator {
+            margin: 0 8px;
+            color: #6c757d;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>DAG Interactive Visualizer</h1>
+            <p>Click on blue or gold nodes to explore module details</p>
+        </div>
+        
+        <div class="breadcrumb">
+            <span class="breadcrumb-item active" id="breadcrumb-root">Module Overview</span>
+        </div>
+        
+        <div class="controls">
+            <button class="btn" id="btn-visualize">Load Visualization</button>
+            <button class="btn" id="btn-back" style="display: none;">Back to Overview</button>
+            <button class="btn btn-execute" id="btn-execute">Execute Module</button>
+            <button class="btn btn-refresh-status" id="btn-refresh-status">Refresh Edge Status</button>
+            <button class="btn btn-clear-cache" id="btn-clear-cache">Clear Cache</button>
+            <button class="btn" id="btn-refresh">Refresh</button>
+            
+            <div class="status" id="status-message"></div>
+        </div>
+        
+        <div class="loading" id="loading">
+            <p>Loading visualization...</p>
+        </div>
+        
+        <div class="main-content">
+            <div class="plot-section">
+        <div class="plot-container">
+            <div id="plot-div"></div>
+                </div>
+            </div>
+            
+            <div class="results-section">
+                <div class="results-header">Execution Results</div>
+                <div class="results-content" id="results-content">
+                    <p style="color: #666; font-style: italic;">No execution results yet. Click "Execute Module" to run the current module.</p>
+                </div>
+                
+                <div class="edge-status-section">
+                    <div class="edge-status-header">Edge Status</div>
+                    <div class="edge-status-list" id="edge-status-list">
+                        <div style="padding: 10px; color: #666; font-style: italic;">Click "Refresh Edge Status" to view edge states.</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="legend">
+            <div class="legend-item">
+                <span class="legend-color" style="background-color: #87CEEB;"></span>
+                Clickable Module
+            </div>
+            <div class="legend-item">
+                <span class="legend-color" style="background-color: #FFD700;"></span>
+                Module Group
+            </div>
+            <div class="legend-item">
+                <span class="legend-color" style="background-color: #D3D3D3;"></span>
+                Non-clickable
+            </div>
+            <div class="legend-item">
+                <span class="legend-color" style="background-color: #90EE90;"></span>
+                Connected Input
+            </div>
+            <div class="legend-item">
+                <span class="legend-color" style="background-color: #FFB6C1;"></span>
+                Unconnected Input
+            </div>
+            <div class="legend-item">
+                <span class="legend-color" style="background-color: #FF6B6B;"></span>
+                Executed Edge
+            </div>
+        </div>
+    </div>
+
+    <script>
+        class DAGVisualizer {
+            constructor() {
+                this.currentView = 'overview';
+                this.moduleHistory = [];
+                
+                this.initializeElements();
+                this.setupEventListeners();
+            }
+            
+            initializeElements() {
+                this.btnVisualize = document.getElementById('btn-visualize');
+                this.btnBack = document.getElementById('btn-back');
+                this.btnExecute = document.getElementById('btn-execute');
+                this.btnRefreshStatus = document.getElementById('btn-refresh-status');
+                this.btnClearCache = document.getElementById('btn-clear-cache');
+                this.btnRefresh = document.getElementById('btn-refresh');
+                this.statusMessage = document.getElementById('status-message');
+                this.loading = document.getElementById('loading');
+                this.plotDiv = document.getElementById('plot-div');
+                this.breadcrumbRoot = document.getElementById('breadcrumb-root');
+                this.resultsContent = document.getElementById('results-content');
+                this.edgeStatusList = document.getElementById('edge-status-list');
+            }
+            
+            setupEventListeners() {
+                this.btnVisualize.addEventListener('click', () => this.loadVisualization());
+                this.btnBack.addEventListener('click', () => this.goBack());
+                this.btnExecute.addEventListener('click', () => this.executeModule());
+                this.btnRefreshStatus.addEventListener('click', () => this.refreshEdgeStatus());
+                this.btnClearCache.addEventListener('click', () => this.clearCache());
+                this.btnRefresh.addEventListener('click', () => this.refresh());
+            }
+            
+            showLoading() {
+                this.loading.style.display = 'block';
+                this.plotDiv.style.display = 'none';
+            }
+            
+            hideLoading() {
+                this.loading.style.display = 'none';
+                this.plotDiv.style.display = 'block';
+            }
+            
+            showStatus(message, type = 'success') {
+                this.statusMessage.textContent = message;
+                this.statusMessage.className = `status ${type}`;
+                this.statusMessage.style.display = 'block';
+                
+                // Auto hide after 5 seconds
+                setTimeout(() => {
+                    this.statusMessage.style.display = 'none';
+                }, 5000);
+            }
+            
+            updateBreadcrumb(moduleName = null) {
+                if (moduleName) {
+                    this.breadcrumbRoot.innerHTML = `
+                        Module Overview 
+                        <span class="breadcrumb-separator">></span>
+                        <span class="breadcrumb-item active">${moduleName}</span>
+                    `;
+                } else {
+                    this.breadcrumbRoot.innerHTML = 'Module Overview';
+                }
+            }
+            
+            async loadVisualization() {
+                try {
+                    this.showLoading();
+                    this.btnVisualize.disabled = true;
+                    
+                    const response = await fetch('/api/visualize', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        }
+                    });
+                    
+                    const data = await response.json();
+                    
+                    if (data.success) {
+                        this.renderPlot(data.plotly_data);
+                        
+                        if (data.has_cycles) {
+                            this.showStatus(
+                                `Warning: Cycles detected in the graph! Cycles: ${JSON.stringify(data.cycles)}`, 
+                                'warning'
+                            );
+                        } else {
+                            this.showStatus('Visualization loaded successfully');
+                        }
+                        
+                        this.currentView = 'overview';
+                        this.updateBreadcrumb();
+                        this.btnBack.style.display = 'none';
+                    } else {
+                        this.showStatus(`Error: ${data.error}`, 'error');
+                    }
+                } catch (error) {
+                    this.showStatus(`Network error: ${error.message}`, 'error');
+                } finally {
+                    this.hideLoading();
+                    this.btnVisualize.disabled = false;
+                }
+            }
+            
+            async loadNodeDetail(nodeId) {
+                try {
+                    this.showLoading();
+                    
+                    const response = await fetch('/api/node_detail', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({ node_id: nodeId })
+                    });
+                    
+                    const data = await response.json();
+                    
+                    if (data.success) {
+                        this.renderPlot(data.plotly_data);
+                        this.showStatus(`Loaded details for ${data.module_name}`);
+                        
+                        this.currentView = 'detail';
+                        this.updateBreadcrumb(data.module_name);
+                        
+                        // Show back button when in detail view
+                        this.btnBack.style.display = 'inline-block';
+                    } else {
+                        this.showStatus(`Error: ${data.error}`, 'error');
+                    }
+                } catch (error) {
+                    this.showStatus(`Network error: ${error.message}`, 'error');
+                } finally {
+                    this.hideLoading();
+                }
+            }
+            
+            async goBack() {
+                try {
+                    this.showLoading();
+                    
+                    const response = await fetch('/api/back', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        }
+                    });
+                    
+                    const data = await response.json();
+                    
+                    if (data.success) {
+                        this.renderPlot(data.plotly_data);
+                        
+                        if (data.is_detail_view) {
+                            this.showStatus(`Back to ${data.module_name}`);
+                            this.currentView = 'detail';
+                            this.updateBreadcrumb(data.module_name);
+                        } else {
+                            this.showStatus('Back to main overview');
+                            this.currentView = 'overview';
+                            this.updateBreadcrumb();
+                        }
+                        
+                        // Update back button visibility
+                        if (data.can_go_back) {
+                            this.btnBack.style.display = 'inline-block';
+                        } else {
+                            this.btnBack.style.display = 'none';
+                        }
+                    } else {
+                        this.showStatus(`Error: ${data.error}`, 'error');
+                    }
+                } catch (error) {
+                    this.showStatus(`Network error: ${error.message}`, 'error');
+                } finally {
+                    this.hideLoading();
+                }
+            }
+            
+            renderPlot(plotlyData) {
+                // Clear existing plot
+                Plotly.purge(this.plotDiv);
+                
+                // Create new plot
+                Plotly.newPlot(this.plotDiv, plotlyData.data, plotlyData.layout, {
+                    responsive: true,
+                    displayModeBar: true,
+                    modeBarButtonsToRemove: ['lasso2d', 'select2d']
+                });
+                
+                // Add click event listener
+                this.plotDiv.on('plotly_click', (eventData) => {
+                    if (eventData.points && eventData.points.length > 0) {
+                        const point = eventData.points[0];
+                        const customData = point.customdata;
+                        
+                        if (customData && customData.clickable) {
+                            this.loadNodeDetail(customData.node_id);
+                        } else {
+                            this.showStatus('This node is not clickable', 'warning');
+                        }
+                    }
+                });
+            }
+            
+            async executeModule() {
+                try {
+                    this.showLoading();
+                    this.btnExecute.disabled = true;
+                    
+                    const response = await fetch('/api/execute', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        }
+                    });
+                    
+                    const data = await response.json();
+                    
+                    if (data.success) {
+                        // Display execution results
+                        this.displayExecutionResults(data);
+                        
+                        // Refresh visualization to show executed edges
+                        if (data.plotly_data) {
+                            this.renderPlot(data.plotly_data);
+                        }
+                        
+                        this.showStatus('Module executed successfully');
+                    } else {
+                        this.showStatus(`Error: ${data.error}`, 'error');
+                    }
+                } catch (error) {
+                    this.showStatus(`Network error: ${error.message}`, 'error');
+                } finally {
+                    this.hideLoading();
+                    this.btnExecute.disabled = false;
+                }
+            }
+            
+            displayExecutionResults(data) {
+                let html = '';
+                
+                // Execution info
+                if (data.execution_info) {
+                    html += '<div class="execution-info">';
+                    html += '<h4>Execution Summary</h4>';
+                    html += `<div>Module: ${data.execution_info.module_name}</div>`;
+                    html += `<div>Execution Time: ${data.execution_info.execution_time}s</div>`;
+                    html += `<div>Status: ${data.execution_info.status}</div>`;
+                    html += '</div>';
+                }
+                
+                // Results
+                if (data.results) {
+                    html += '<div><strong>Results:</strong></div>';
+                    html += '<pre>' + JSON.stringify(data.results, null, 2) + '</pre>';
+                }
+                
+                // Output logs
+                if (data.output_logs && data.output_logs.length > 0) {
+                    html += '<div><strong>Output Logs:</strong></div>';
+                    data.output_logs.forEach(log => {
+                        html += '<div>' + log + '</div>';
+                    });
+                }
+                
+                this.resultsContent.innerHTML = html;
+            }
+            
+            async refreshEdgeStatus() {
+                try {
+                    this.showLoading();
+                    
+                    const response = await fetch('/api/edge_status', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        }
+                    });
+                    
+                    const data = await response.json();
+                    
+                    if (data.success) {
+                        this.displayEdgeStatus(data.edge_status);
+                        
+                        // Refresh visualization to show updated edge colors
+                        if (data.plotly_data) {
+                            this.renderPlot(data.plotly_data);
+                }
+                        
+                        this.showStatus('Edge status refreshed successfully');
+                    } else {
+                        this.showStatus(`Error: ${data.error}`, 'error');
+                    }
+                } catch (error) {
+                    this.showStatus(`Network error: ${error.message}`, 'error');
+                } finally {
+                    this.hideLoading();
+                }
+            }
+            
+            displayEdgeStatus(edgeStatusList) {
+                this.edgeStatusList.innerHTML = '';
+                
+                if (!edgeStatusList || edgeStatusList.length === 0) {
+                    this.edgeStatusList.innerHTML = '<div style="padding: 10px; color: #666; font-style: italic;">No edges found.</div>';
+                    return;
+                }
+                
+                edgeStatusList.forEach((status, index) => {
+                    const item = document.createElement('div');
+                    let className = 'edge-status-item ';
+                    let statusText = '';
+                    
+                    if (status.is_cached) {
+                        className += 'edge-cached';
+                        statusText = 'Cached';
+                    } else if (status.is_active) {
+                        className += 'edge-active';
+                        statusText = 'Active';
+                    } else {
+                        className += 'edge-inactive';
+                        statusText = 'Inactive';
+                    }
+                    
+                    item.className = className;
+                    item.innerHTML = `
+                        <div><strong>${status.name}</strong></div>
+                        <div>Status: ${statusText}</div>
+                        <div>Type: ${status.edge_type || 'normal'}</div>
+                        ${status.cache_type ? `<div>Cache Type: ${status.cache_type}</div>` : ''}
+                    `;
+                    
+                    this.edgeStatusList.appendChild(item);
+                });
+            }
+            
+            async clearCache() {
+                try {
+                    this.showLoading();
+                    this.btnClearCache.disabled = true;
+                    
+                    const response = await fetch('/api/clear_cache', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        }
+                    });
+                    
+                    const data = await response.json();
+                    
+                    if (data.success) {
+                        // Refresh visualization to show cleared edges
+                        if (data.plotly_data) {
+                            this.renderPlot(data.plotly_data);
+                        }
+                        
+                        // Refresh edge status display
+                        this.refreshEdgeStatus();
+                        
+                        // Update status message
+                        this.showStatus(`${data.message} - Cache cleared successfully`);
+                        
+                        // Update breadcrumb if in detail view
+                        if (data.is_detail_view && data.module_name) {
+                            this.updateBreadcrumb(data.module_name);
+                        } else {
+                            this.updateBreadcrumb();
+                        }
+                    } else {
+                        this.showStatus(`Error: ${data.error}`, 'error');
+                    }
+                } catch (error) {
+                    this.showStatus(`Network error: ${error.message}`, 'error');
+                } finally {
+                    this.hideLoading();
+                    this.btnClearCache.disabled = false;
+                }
+            }
+            
+            refresh() {
+                if (this.currentView === 'overview') {
+                    this.loadVisualization();
+                } else {
+                    this.goBack();
+                }
+            }
+        }
+        
+        // Initialize the visualizer when page loads
+        document.addEventListener('DOMContentLoaded', () => {
+            window.dagVisualizer = new DAGVisualizer();
+        });
+    </script>
+</body>
+</html> 

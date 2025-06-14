@@ -72,3 +72,5 @@ config.yaml
 # 如果你用 docker
 *.pid
 docker-compose.override.yml
+
+archive/

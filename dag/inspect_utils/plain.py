@@ -2,7 +2,7 @@
 Utility functions for visualizing and inspecting DAG modules
 """
 from typing import Any, Dict, List, Union
-from .node import Module, FunctionModule, InspectModule, ModuleGroup, Edge, NullNode, VirtualNode
+from ..node import Module, FunctionModule, InspectModule, ModuleGroup, Edge, NullNode, VirtualNode
 
 
 def inspect_module(module: Module, show_details: bool = True, indent: int = 0) -> str:
