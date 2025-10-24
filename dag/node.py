@@ -290,7 +290,7 @@ class NodeSpec:
     """Declarative node descriptor."""
 
     id: str
-    operator: str
+    operator: Any
     config: Mapping[str, Any] = field(default_factory=dict)
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
@@ -312,7 +312,7 @@ class GraphSpec:
 
     nodes: Mapping[str, NodeSpec]
     edges: Sequence[EdgeSpec]
-    inputs: Mapping[str, str] = field(default_factory=dict)
+    inputs: Mapping[str, Union[str, Sequence[str]]] = field(default_factory=dict)
     outputs: Mapping[str, str] = field(default_factory=dict)
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
@@ -329,9 +329,16 @@ class GraphSpec:
             if isinstance(spec, NodeSpec):
                 nodes[node_id] = spec
             else:
+                operator_spec = spec["operator"]
+                if isinstance(operator_spec, GraphSpec):
+                    operator_value = operator_spec
+                elif isinstance(operator_spec, Mapping):
+                    operator_value = GraphSpec.from_dict(operator_spec)
+                else:
+                    operator_value = operator_spec
                 nodes[node_id] = NodeSpec(
                     id=node_id,
-                    operator=spec["operator"],
+                    operator=operator_value,
                     config=dict(spec.get("config", {})),
                     metadata=dict(spec.get("metadata", {})),
                 )
@@ -399,7 +406,7 @@ class NodeRuntime:
         self._cache_inputs: Optional[Dict[str, Any]] = None
         self._cache_outputs: Optional[Dict[str, Any]] = None
 
-    def execute(
+    def run(
         self,
         inputs: Mapping[str, Any],
         *,
@@ -438,7 +445,7 @@ class GraphRuntime:
         spec: GraphSpec,
         node_runtimes: Mapping[str, NodeRuntime],
         inbound: Mapping[str, Dict[str, Union[GraphInputRef, NodeOutputRef]]],
-        graph_inputs: Mapping[str, Tuple[str, str]],
+        graph_inputs: Mapping[str, List[Tuple[str, str]]],
         graph_outputs: Mapping[str, NodeOutputRef],
         adjacency: Mapping[str, Set[str]],
         topo_order: Sequence[str],
@@ -448,7 +455,7 @@ class GraphRuntime:
         self._inbound = {
             node_id: dict(port_map) for node_id, port_map in inbound.items()
         }
-        self.graph_inputs = dict(graph_inputs)
+        self.graph_inputs = {alias: list(endpoints) for alias, endpoints in graph_inputs.items()}
         self.graph_outputs = dict(graph_outputs)
         self._adjacency = {node: set(targets) for node, targets in adjacency.items()}
         self.topological_order = list(topo_order)
@@ -523,7 +530,10 @@ class GraphRuntime:
                 for port, ref in port_map.items()
                 if isinstance(ref, NodeOutputRef)
             ],
-            "inputs": dict(self.graph_inputs),
+            "inputs": {
+                alias: [f"{node}.{port}" for node, port in endpoints]
+                for alias, endpoints in self.graph_inputs.items()
+            },
             "outputs": {
                 alias: f"{ref.node_id}.{ref.port}"
                 for alias, ref in self.graph_outputs.items()
@@ -552,7 +562,7 @@ class _ExecutionState:
         for node_id in self.runtime.topological_order:
             runtime_node = self.runtime.node_runtimes[node_id]
             kwargs = self._collect_inputs(node_id, runtime_node)
-            outputs = runtime_node.execute(
+            outputs = runtime_node.run(
                 kwargs,
                 use_cache=self.use_cache,
                 force=node_id in self.force_nodes,
@@ -586,6 +596,42 @@ class _ExecutionState:
 # ---------------------------------------------------------------------------
 
 
+def _template_from_graph_spec(
+    graph_spec: GraphSpec,
+    registry: "OperatorRegistry",
+    *,
+    name_hint: Optional[str] = None,
+) -> OperatorTemplate:
+    template_name = name_hint or str(graph_spec.metadata.get("name", "graph"))
+
+    input_defs = {
+        alias: PortDefinition(name=alias)
+        for alias in graph_spec.inputs.keys()
+    }
+    output_defs = {
+        alias: PortDefinition(name=alias)
+        for alias in graph_spec.outputs.keys()
+    }
+    template_metadata = dict(graph_spec.metadata)
+
+    def factory(config: Mapping[str, Any], runtime_id: str) -> OperatorRunner:
+        builder = GraphBuilder(registry)
+        runtime = builder.build(graph_spec)
+        return GraphOperatorRunner(
+            runtime=runtime,
+            name=runtime_id or template_name,
+            output_keys=list(graph_spec.outputs.keys()),
+        )
+
+    return OperatorTemplate(
+        name=template_name,
+        create_runner=factory,
+        input_ports=MappingProxyType(input_defs),
+        output_ports=MappingProxyType(output_defs),
+        metadata=MappingProxyType(template_metadata),
+    )
+
+
 class GraphBuilder:
     """Materialises GraphRuntime instances from specs."""
 
@@ -604,7 +650,28 @@ class GraphBuilder:
         for node_id, node_spec in spec.nodes.items():
             if node_id in node_runtimes:
                 raise GraphBuildError(f"Duplicate node id '{node_id}' in GraphSpec")
-            template = self.registry.get(node_spec.operator)
+            operator_ref = node_spec.operator
+            if isinstance(operator_ref, OperatorTemplate):
+                template = operator_ref
+            elif isinstance(operator_ref, str):
+                template = self.registry.get(operator_ref)
+            elif isinstance(operator_ref, GraphSpec):
+                template = _template_from_graph_spec(
+                    operator_ref,
+                    self.registry,
+                    name_hint=node_spec.metadata.get("name", node_id),
+                )
+            elif isinstance(operator_ref, Mapping):
+                nested_spec = GraphSpec.from_dict(operator_ref)
+                template = _template_from_graph_spec(
+                    nested_spec,
+                    self.registry,
+                    name_hint=node_spec.metadata.get("name", node_id),
+                )
+            else:
+                raise RegistrationError(
+                    f"Unsupported operator reference for node '{node_id}': {type(operator_ref)!r}"
+                )
             runner = template.instantiate(config=node_spec.config, runtime_id=node_id)
             node_runtimes[node_id] = NodeRuntime(
                 node_id=node_id,
@@ -614,26 +681,33 @@ class GraphBuilder:
             )
             in_degree[node_id] = 0
 
-        graph_inputs: Dict[str, Tuple[str, str]] = {}
+        graph_inputs: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
 
-        for alias, endpoint in spec.inputs.items():
-            node_id, port = _parse_endpoint(endpoint)
-            if node_id not in node_runtimes:
-                raise GraphBuildError(
-                    f"Graph input '{alias}' targets unknown node '{node_id}'"
-                )
-            node_runtime = node_runtimes[node_id]
-            if port not in node_runtime.input_ports:
-                raise GraphBuildError(
-                    f"Graph input '{alias}' targets unknown input port "
-                    f"'{port}' on node '{node_id}'"
-                )
-            if port in inbound[node_id]:
-                raise GraphBuildError(
-                    f"Input port '{port}' on node '{node_id}' already bound"
-                )
-            inbound[node_id][port] = GraphInputRef(alias)
-            graph_inputs[alias] = (node_id, port)
+        for alias, endpoint_spec in spec.inputs.items():
+            endpoints = endpoint_spec
+            if isinstance(endpoint_spec, (list, tuple)):
+                endpoints = list(endpoint_spec)
+            else:
+                endpoints = [endpoint_spec]
+
+            for endpoint in endpoints:
+                node_id, port = _parse_endpoint(endpoint)
+                if node_id not in node_runtimes:
+                    raise GraphBuildError(
+                        f"Graph input '{alias}' targets unknown node '{node_id}'"
+                    )
+                node_runtime = node_runtimes[node_id]
+                if port not in node_runtime.input_ports:
+                    raise GraphBuildError(
+                        f"Graph input '{alias}' targets unknown input port "
+                        f"'{port}' on node '{node_id}'"
+                    )
+                if port in inbound[node_id]:
+                    raise GraphBuildError(
+                        f"Input port '{port}' on node '{node_id}' already bound"
+                    )
+                inbound[node_id][port] = GraphInputRef(alias)
+                graph_inputs[alias].append((node_id, port))
 
         for edge in spec.edges:
             (src_node, src_port), (dst_node, dst_port) = edge.unpack()

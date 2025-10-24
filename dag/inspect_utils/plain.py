@@ -1,213 +1,321 @@
-"""
-Utility functions for visualizing and inspecting DAG modules
-"""
-from typing import Any, Dict, List, Union
-from ..node import Module, FunctionModule, InspectModule, ModuleGroup, Edge, NullNode, VirtualNode
+"""Console-friendly inspection helpers for graph runtimes."""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Mapping, Optional
+
+from ..node import (
+    GraphInputRef,
+    GraphRuntime,
+    GraphSpec,
+    NodeOutputRef,
+    OperatorTemplate,
+    PortDefinition,
+)
 
 
-def inspect_module(module: Module, show_details: bool = True, indent: int = 0) -> str:
-    """
-    Generate a comprehensive visualization of a module's interface
-    
-    Args:
-        module: The module to inspect
-        show_details: Whether to show detailed information
-        indent: Indentation level for nested display
-        
-    Returns:
-        Formatted string representation of the module
-    """
-    lines = []
-    prefix = "  " * indent
-    
-    # Module header
-    module_type = module.__class__.__name__
-    lines.append(f"{prefix}📦 {module_type}: {module.name}")
-    lines.append(f"{prefix}{'=' * (len(module_type) + len(module.name) + 4)}")
-    
-    # Basic info
-    if show_details:
-        lines.append(f"{prefix}🔧 Parent: {module.parent.name if module.parent else 'None'}")
-        lines.append(f"{prefix}📊 Input Count: {module.indirect or len(module._prev)}")
-        lines.append(f"{prefix}📤 Output Count: {module.outdirect or len(module._next)}")
-        lines.append("")
-    
-    # Input parameters
-    if module._prev:
-        lines.append(f"{prefix}📥 INPUTS:")
-        lines.append(f"{prefix}{'-' * 40}")
-        for param_name, edge in module._prev.items():
-            status = _get_edge_status(edge)
-            default_info = ""
-            if param_name in getattr(module, '_default_values', {}):
-                default_val = module._default_values[param_name]
-                default_info = f" (default: {repr(default_val)})"
-            
-            lines.append(f"{prefix}  • {param_name}{default_info}")
-            if show_details:
-                lines.append(f"{prefix}    Status: {status}")
-                if edge.src != NullNode and edge.src != VirtualNode:
-                    lines.append(f"{prefix}    Source: {edge.src}")
-        lines.append("")
-    else:
-        lines.append(f"{prefix}📥 INPUTS: None")
-        lines.append("")
-    
-    # Output parameters
-    if module._next:
-        lines.append(f"{prefix}📤 OUTPUTS:")
-        lines.append(f"{prefix}{'-' * 40}")
-        for output_name, edges in module._next.items():
-            lines.append(f"{prefix}  • {output_name}")
-            if show_details and edges:
-                for i, edge in enumerate(edges):
-                    status = _get_edge_status(edge)
-                    lines.append(f"{prefix}    [{i}] Status: {status}")
-                    if edge.tgt != NullNode and edge.tgt != VirtualNode:
-                        lines.append(f"{prefix}    [{i}] Target: {edge.tgt}")
-        lines.append("")
-    else:
-        lines.append(f"{prefix}📤 OUTPUTS: None")
-        lines.append("")
-    
-    # Special handling for different module types
-    if isinstance(module, FunctionModule):
-        lines.extend(_inspect_function_module(module, prefix))
-    elif isinstance(module, InspectModule) and not isinstance(module, ModuleGroup):
-        lines.extend(_inspect_inspect_module(module, prefix))
-    elif isinstance(module, ModuleGroup):
-        lines.extend(_inspect_module_group(module, prefix, show_details))
-    
+Serializable = Dict[str, Any]
+
+
+def runtime_to_dict(runtime: GraphRuntime) -> Serializable:
+    """Convert a GraphRuntime into a plain python dictionary."""
+    visited: Dict[int, Serializable] = {}
+    return _serialise_graph(runtime, visited)
+
+
+def render_runtime_text(
+    runtime: GraphRuntime,
+    *,
+    indent: int = 0,
+    indent_step: int = 2,
+) -> str:
+    """Render a GraphRuntime into a readable text block with indentation."""
+    graph_dict = runtime_to_dict(runtime)
+    lines = _format_graph_dict(graph_dict, indent=indent, indent_step=indent_step)
     return "\n".join(lines)
 
 
-def _get_edge_status(edge: Edge) -> str:
-    """Get human-readable status of an edge"""
-    if edge.src == NullNode or edge.tgt == NullNode:
-        return "🔴 Null (Unconnected)"
-    elif edge.src == VirtualNode or edge.tgt == VirtualNode:
-        return "🟡 Virtual (Group Interface)"
-    elif edge.is_cached:
-        cache_type = type(edge._cache).__name__ if edge._cache is not None else "None"
-        return f"🟢 Cached ({cache_type})"
-    elif edge.is_active:
-        return "🔵 Active (Ready)"
-    else:
-        return "⚫ Inactive"
+def print_runtime(
+    runtime: GraphRuntime,
+    *,
+    indent: int = 0,
+    indent_step: int = 2,
+) -> None:
+    """Pretty-print a GraphRuntime to stdout."""
+    print(render_runtime_text(runtime, indent=indent, indent_step=indent_step))
 
 
-def _inspect_function_module(module: FunctionModule, prefix: str) -> List[str]:
-    """Inspect FunctionModule specific details"""
-    lines = []
-    lines.append(f"{prefix}🔍 FUNCTION DETAILS:")
-    lines.append(f"{prefix}{'-' * 40}")
-    lines.append(f"{prefix}  Function: {module.func.__name__}")
-    if hasattr(module.func, '__doc__') and module.func.__doc__:
-        doc = module.func.__doc__.strip().split('\n')[0]  # First line only
-        lines.append(f"{prefix}  Description: {doc}")
-    lines.append(f"{prefix}  Signature: {module.func_signature}")
-    lines.append(f"{prefix}  Use Default Return: {module.use_default_return}")
-    lines.append("")
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _serialise_graph(
+    runtime: GraphRuntime,
+    visited: Dict[int, Serializable],
+) -> Serializable:
+    runtime_id = id(runtime)
+    if runtime_id in visited:
+        return {"type": "graph_ref", "id": runtime_id}
+
+    spec = runtime.spec
+    graph_dict: Serializable = {
+        "type": "graph",
+        "id": runtime_id,
+        "name": spec.metadata.get("name"),
+        "metadata": dict(spec.metadata),
+        "inputs": _serialise_graph_inputs(runtime),
+        "outputs": _serialise_graph_outputs(runtime),
+        "nodes": [],
+        "edges": _serialise_edges(runtime),
+        "topology": list(runtime.topological_order),
+    }
+    visited[runtime_id] = graph_dict
+
+    for node_id in runtime.topological_order:
+        node_runtime = runtime.node_runtimes[node_id]
+        node_spec = spec.nodes[node_id]
+        node_dict: Serializable = {
+            "id": node_id,
+            "operator": _serialise_operator(node_spec, node_runtime, visited),
+            "config": dict(node_spec.config),
+            "metadata": dict(node_spec.metadata),
+            "inputs": _serialise_node_inputs(runtime, node_id, node_runtime.input_ports),
+            "outputs": sorted(node_runtime.output_ports.keys()),
+        }
+        graph_dict["nodes"].append(node_dict)
+
+    return graph_dict
+
+
+def _serialise_graph_inputs(runtime: GraphRuntime) -> Dict[str, List[str]]:
+    result: Dict[str, List[str]] = {}
+    for alias, endpoints in runtime.graph_inputs.items():
+        result[alias] = [f"{node}.{port}" for node, port in endpoints]
+    return result
+
+
+def _serialise_graph_outputs(runtime: GraphRuntime) -> Dict[str, str]:
+    result: Dict[str, str] = {}
+    for alias, ref in runtime.graph_outputs.items():
+        result[alias] = f"{ref.node_id}.{ref.port}"
+    return result
+
+
+def _serialise_edges(runtime: GraphRuntime) -> List[Serializable]:
+    edges: List[Serializable] = []
+    for dst_node, port_map in runtime._inbound.items():  # pylint: disable=protected-access
+        for dst_port, ref in port_map.items():
+            if isinstance(ref, NodeOutputRef):
+                edges.append(
+                    {
+                        "src": {"node": ref.node_id, "port": ref.port},
+                        "dst": {"node": dst_node, "port": dst_port},
+                    }
+                )
+    return edges
+
+
+def _serialise_operator(
+    node_spec,
+    node_runtime,
+    visited: Dict[int, Serializable],
+) -> Serializable:
+    operator_ref = node_spec.operator
+
+    if isinstance(operator_ref, GraphSpec):
+        nested_runtime = _extract_nested_runtime(node_runtime)
+        nested_graph = (
+            _serialise_graph(nested_runtime, visited) if nested_runtime else None
+        )
+        return {
+            "type": "inline_graph",
+            "name": node_runtime.template.name,
+            "graph": nested_graph,
+        }
+
+    if isinstance(operator_ref, OperatorTemplate):
+        return {"type": "template", "name": operator_ref.name}
+
+    if isinstance(operator_ref, str):
+        return {"type": "registered", "name": operator_ref}
+
+    return {"type": "object", "repr": repr(operator_ref)}
+
+
+def _extract_nested_runtime(node_runtime) -> Optional[GraphRuntime]:
+    runner = node_runtime.runner
+    return getattr(runner, "_runtime", None)
+
+
+def _serialise_node_inputs(
+    runtime: GraphRuntime,
+    node_id: str,
+    port_defs: Mapping[str, PortDefinition],
+) -> Dict[str, Serializable]:
+    inputs: Dict[str, Serializable] = {}
+    inbound = runtime._inbound.get(node_id, {})  # pylint: disable=protected-access
+
+    for port_name in sorted(port_defs.keys()):
+        ref = inbound.get(port_name)
+        port_def = port_defs[port_name]
+        inputs[port_name] = _serialise_input_ref(ref, port_def)
+
+    return inputs
+
+
+def _serialise_input_ref(
+    ref: Optional[object],
+    port_def: PortDefinition,
+) -> Serializable:
+    if isinstance(ref, GraphInputRef):
+        return {"type": "graph_input", "name": ref.name}
+
+    if isinstance(ref, NodeOutputRef):
+        return {"type": "node_output", "node": ref.node_id, "port": ref.port}
+
+    if not port_def.required:
+        return {"type": "default", "value": port_def.default}
+
+    return {"type": "unbound"}
+
+
+def _format_graph_dict(
+    graph_dict: Serializable,
+    *,
+    indent: int,
+    indent_step: int,
+) -> List[str]:
+    prefix = " " * indent
+    lines: List[str] = []
+
+    name = graph_dict.get("name") or "<graph>"
+    lines.append(f"{prefix}Graph {name}")
+
+    metadata = graph_dict.get("metadata") or {}
+    if metadata:
+        lines.append(
+            f"{prefix}{' ' * indent_step}metadata: {_format_mapping(metadata)}"
+        )
+
+    inputs = graph_dict.get("inputs", {})
+    if inputs:
+        lines.append(f"{prefix}{' ' * indent_step}Inputs:")
+        for alias, endpoints in sorted(inputs.items()):
+            targets = ", ".join(endpoints)
+            lines.append(f"{prefix}{' ' * (2 * indent_step)}{alias} -> {targets}")
+
+    outputs = graph_dict.get("outputs", {})
+    if outputs:
+        lines.append(f"{prefix}{' ' * indent_step}Outputs:")
+        for alias, endpoint in sorted(outputs.items()):
+            lines.append(f"{prefix}{' ' * (2 * indent_step)}{alias} <- {endpoint}")
+
+    nodes = graph_dict.get("nodes", [])
+    if nodes:
+        lines.append(f"{prefix}{' ' * indent_step}Nodes:")
+        for node in nodes:
+            lines.extend(
+                _format_node(
+                    node,
+                    indent=indent + 2 * indent_step,
+                    indent_step=indent_step,
+                )
+            )
+
     return lines
 
 
-def _inspect_inspect_module(module: InspectModule, prefix: str) -> List[str]:
-    """Inspect InspectModule specific details"""
-    lines = []
-    lines.append(f"{prefix}🔍 INSPECT MODULE DETAILS:")
-    lines.append(f"{prefix}{'-' * 40}")
-    if hasattr(module, 'forward') and hasattr(module.forward, '__doc__') and module.forward.__doc__:
-        doc = module.forward.__doc__.strip().split('\n')[0]  # First line only
-        lines.append(f"{prefix}  Forward Description: {doc}")
-    lines.append(f"{prefix}  Use Default Return: {module.use_default_return}")
-    lines.append("")
+def _format_node(
+    node: Serializable,
+    *,
+    indent: int,
+    indent_step: int,
+) -> List[str]:
+    prefix = " " * indent
+    lines: List[str] = []
+    op_info = node.get("operator", {})
+
+    op_desc = _describe_operator(op_info)
+    lines.append(f"{prefix}- {node['id']} :: {op_desc}")
+
+    inputs = node.get("inputs", {})
+    if inputs:
+        lines.append(f"{prefix}{' ' * indent_step}inputs:")
+        for port, ref in sorted(inputs.items()):
+            lines.append(
+                f"{prefix}{' ' * (2 * indent_step)}{port} <- {_describe_input_ref(ref)}"
+            )
+
+    outputs = node.get("outputs", [])
+    if outputs:
+        formatted = ", ".join(outputs)
+        lines.append(f"{prefix}{' ' * indent_step}outputs: {formatted}")
+
+    config = node.get("config", {})
+    if config:
+        lines.append(
+            f"{prefix}{' ' * indent_step}config: {_format_mapping(config)}"
+        )
+
+    metadata = node.get("metadata", {})
+    if metadata:
+        lines.append(
+            f"{prefix}{' ' * indent_step}metadata: {_format_mapping(metadata)}"
+        )
+
+    if op_info.get("type") == "inline_graph" and op_info.get("graph"):
+        nested_lines = _format_graph_dict(
+            op_info["graph"],
+            indent=indent + 3 * indent_step,
+            indent_step=indent_step,
+        )
+        lines.append(f"{prefix}{' ' * indent_step}nested:")
+        lines.extend(nested_lines)
+
     return lines
 
 
-def _inspect_module_group(module: ModuleGroup, prefix: str, show_details: bool) -> List[str]:
-    """Inspect ModuleGroup specific details"""
-    lines = []
-    lines.append(f"{prefix}🏗️  MODULE GROUP DETAILS:")
-    lines.append(f"{prefix}{'-' * 40}")
-    lines.append(f"{prefix}  Child Modules: {len(module._modules)}")
-    
-    # Input mappings
-    if module._prev_name_map:
-        lines.append(f"{prefix}  📥 Input Mappings:")
-        for group_key, mapping in module._prev_name_map.items():
-            if isinstance(mapping, tuple) and len(mapping) == 2:
-                if hasattr(mapping[0], 'name'):  # Module reference
-                    module_name = mapping[0].name
-                else:  # String name
-                    module_name = mapping[0]
-                lines.append(f"{prefix}    {group_key} → {module_name}.{mapping[1]}")
-            else:
-                lines.append(f"{prefix}    {group_key} → {mapping}")
-    
-    # Output mappings
-    if module._next_name_map:
-        lines.append(f"{prefix}  📤 Output Mappings:")
-        for group_key, mapping in module._next_name_map.items():
-            if isinstance(mapping, tuple) and len(mapping) == 2:
-                if hasattr(mapping[0], 'name'):  # Module reference
-                    module_name = mapping[0].name
-                else:  # String name
-                    module_name = mapping[0]
-                lines.append(f"{prefix}    {group_key} → {module_name}.{mapping[1]}")
-            else:
-                lines.append(f"{prefix}    {group_key} → {mapping}")
-    
-    # Child modules summary
-    if show_details and module._modules:
-        lines.append(f"{prefix}  🧩 Child Modules:")
-        for child_name, child_module in module._modules.items():
-            child_type = child_module.__class__.__name__
-            input_count = len(child_module._prev)
-            output_count = len(child_module._next)
-            lines.append(f"{prefix}    • {child_name} ({child_type}) - In:{input_count}, Out:{output_count}")
-    
-    lines.append("")
-    return lines
+def _describe_operator(op: Mapping[str, Any]) -> str:
+    op_type = op.get("type")
+    name = op.get("name")
+
+    if op_type == "inline_graph":
+        return f"inline graph [{name or 'anonymous'}]"
+
+    if op_type == "registered":
+        return f"operator:{name}"
+
+    if op_type == "template":
+        return f"template:{name}"
+
+    if op_type == "object":
+        return f"object:{name or op.get('repr')}"
+
+    return op_type or "unknown"
 
 
-def inspect_module_tree(module: Module, max_depth: int = 2, current_depth: int = 0) -> str:
-    """
-    Generate a tree view of module hierarchy
-    
-    Args:
-        module: Root module to inspect
-        max_depth: Maximum depth to traverse
-        current_depth: Current traversal depth
-        
-    Returns:
-        Tree-formatted string representation
-    """
-    lines = []
-    
-    # Current module info
-    lines.append(inspect_module(module, show_details=(current_depth == 0), indent=current_depth))
-    
-    # Recurse into child modules if it's a ModuleGroup and we haven't reached max depth
-    if isinstance(module, ModuleGroup) and current_depth < max_depth and module._modules:
-        lines.append("  " * current_depth + "📁 CHILD MODULES:")
-        lines.append("  " * current_depth + "=" * 50)
-        for child_name, child_module in module._modules.items():
-            lines.append(inspect_module_tree(child_module, max_depth, current_depth + 1))
-    
-    return "\n".join(lines)
+def _describe_input_ref(ref: Mapping[str, Any]) -> str:
+    ref_type = ref.get("type")
+    if ref_type == "graph_input":
+        return f"input({ref['name']})"
+    if ref_type == "node_output":
+        return f"{ref['node']}.{ref['port']}"
+    if ref_type == "default":
+        return f"default={repr(ref.get('value'))}"
+    if ref_type == "unbound":
+        return "<unbound>"
+    return "<unknown>"
 
 
-def print_module(module: Module, detailed: bool = True, tree_view: bool = False, max_depth: int = 2):
-    """
-    Print module information to console
-    
-    Args:
-        module: Module to inspect
-        detailed: Whether to show detailed information
-        tree_view: Whether to show tree view for ModuleGroups
-        max_depth: Maximum depth for tree view
-    """
-    if tree_view and isinstance(module, ModuleGroup):
-        print(inspect_module_tree(module, max_depth))
-    else:
-        print(inspect_module(module, detailed))
+def _format_mapping(mapping: Mapping[str, Any]) -> str:
+    pairs = [f"{key}={repr(value)}" for key, value in sorted(mapping.items())]
+    return ", ".join(pairs) if pairs else "{}"
+
+
+# Backwards compatibility -----------------------------------------------------------------
+
+
+def print_module(*args: Any, **kwargs: Any) -> None:
+    """Alias retained for older codepaths."""
+    print_runtime(*args, **kwargs)
