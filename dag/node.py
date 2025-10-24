@@ -316,6 +316,44 @@ class GraphSpec:
     outputs: Mapping[str, str] = field(default_factory=dict)
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "GraphSpec":
+        nodes_raw = data.get("nodes", {})
+        edges_raw = data.get("edges", [])
+        inputs = dict(data.get("inputs", {}))
+        outputs = dict(data.get("outputs", {}))
+        metadata = dict(data.get("metadata", {}))
+
+        nodes: Dict[str, NodeSpec] = {}
+        for node_id, spec in nodes_raw.items():
+            if isinstance(spec, NodeSpec):
+                nodes[node_id] = spec
+            else:
+                nodes[node_id] = NodeSpec(
+                    id=node_id,
+                    operator=spec["operator"],
+                    config=dict(spec.get("config", {})),
+                    metadata=dict(spec.get("metadata", {})),
+                )
+
+        edges: List[EdgeSpec] = []
+        for spec in edges_raw:
+            if isinstance(spec, EdgeSpec):
+                edges.append(spec)
+            else:
+                edges.append(EdgeSpec(src=spec["src"], dst=spec["dst"]))
+
+        if not outputs:
+            raise GraphBuildError("Graph specification requires at least one output")
+
+        return cls(
+            nodes=nodes,
+            edges=edges,
+            inputs=inputs,
+            outputs=outputs,
+            metadata=metadata,
+        )
+
 
 @dataclass(frozen=True)
 class GraphInputRef:
@@ -330,7 +368,6 @@ class NodeOutputRef:
 
     node_id: str
     port: str
-
 
 # ---------------------------------------------------------------------------
 # Graph runtime
