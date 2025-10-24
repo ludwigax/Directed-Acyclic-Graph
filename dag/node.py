@@ -1,613 +1,999 @@
-import re
-import warnings
-from abc import ABC, abstractmethod
-from collections import defaultdict
-from collections.abc import Iterable
-from typing import Tuple, Dict, List, Union, Optional, Any, Callable
-from dataclasses import dataclass
-import functools
+"""
+Declarative DAG core module.
+
+This module introduces a declaration/execution split for building directed
+acyclic computation graphs. Users describe graphs with lightweight specs
+(`NodeSpec`, `EdgeSpec`, `GraphSpec`) and let a builder materialise runnable
+graphs. Operators (functions, classes, or even other graphs) are registered in
+an `OperatorRegistry`, which automatically infers input/output ports through
+Python introspection.
+"""
+
+from __future__ import annotations
 
 import inspect
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    MutableMapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    Set,
+)
+
 from .dbg import Debug, get_debug_state
 
 
-class Node(ABC):
-    def __init__(self, name: str = None, **kwargs):
-        self._auto_name = self.__class__.__name__ + str(id(self))[-4:]
-        self.name = name or self._auto_name
-
-        if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', self.name):
-            raise ValueError(f"Invalid name '{self.name}'. Name must start with a letter or underscore and can only contain letters, digits, and underscores.")
-
-    def __str__(self):
-        return f"{self.__class__.__name__}({self.name})"
-    
-    @abstractmethod
-    def __repr__(self):
-        extra_repr = self.extra_repr()
-        if extra_repr:
-            return f"{self.__class__.__name__}({self.name}, {extra_repr})"
-        return f"{self.__class__.__name__}({self.name})"
-    
-    def extra_repr(self) -> str:
-        return ""
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
 
 
-class _PlaceholderNodeType:
-    __slots__ = ("_name", )
-
-    def __init__(self, name):
-        self._name = name
-
-    def __repr__(self):
-        return f"<{self._name}>"
+class DAGError(Exception):
+    """Base class for all DAG related errors."""
 
 
-NullNode = _PlaceholderNodeType("NullNode")
-VirtualNode = _PlaceholderNodeType("VirtualNode")
+class RegistrationError(DAGError):
+    """Raised when operator registration fails."""
 
 
-@dataclass
-class Edge:
+class GraphBuildError(DAGError):
+    """Raised when a graph specification is invalid or inconsistent."""
+
+
+class ExecutionError(DAGError):
+    """Raised when graph execution fails."""
+
+
+# ---------------------------------------------------------------------------
+# Port and operator declarations
+# ---------------------------------------------------------------------------
+
+_NO_DEFAULT = object()
+
+
+@dataclass(frozen=True)
+class PortDefinition:
+    """Description of a node input/output port."""
+
     name: str
-    src: Union['Node', _PlaceholderNodeType] = NullNode
-    tgt: Union['Node', _PlaceholderNodeType] = NullNode
-    src_key: Optional[str] = None
-    tgt_key: Optional[str] = None
-    is_active: bool = True
-    is_cached: bool = False
-    _cache: Optional[Any] = None
-
-    def __repr__(self):
-        return f"{self.__class__.__name__}({self.name}, src={self.src}, tgt={self.tgt}, cache={type(self._cache)}, is_cached={self.is_cached}, is_active={self.is_active})"
+    type: Any = Any
+    default: Any = _NO_DEFAULT
+    description: Optional[str] = None
 
     @property
-    def null(self):
-        return self.src is NullNode or self.tgt is NullNode
-    
-    @property
-    def virtual(self):
-        return self.src is VirtualNode or self.tgt is VirtualNode
-    
-    @property
-    def cache(self):
-        return self._cache
+    def required(self) -> bool:
+        return self.default is _NO_DEFAULT
 
-    def __call__(self, force: bool = False):
-        if self.is_active or force:
-            return self.cache
-        else:
-            return None
 
-    
-def returns_keys(**kwargs):
-    def decorator(func):
-        func.__returns_keys__ = kwargs
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            return func(*args, **kwargs)
-        return wrapper
+class OperatorRunner(Debug):
+    """Runtime wrapper around an operator implementation."""
+
+    def __init__(self, *, name: str):
+        super().__init__()
+        self.name = name
+
+    def compute(self, **kwargs) -> Mapping[str, Any]:
+        raise NotImplementedError
+
+    def __call__(self, **kwargs) -> Dict[str, Any]:
+        if get_debug_state():
+            self._start_timer()
+        result = self.compute(**kwargs)
+        if get_debug_state():
+            self._stop_timer()
+        if not isinstance(result, Mapping):
+            raise ExecutionError(
+                f"Operator '{self.name}' returned non-mapping output: {type(result)!r}"
+            )
+        return dict(result)
+
+
+class FunctionRunner(OperatorRunner):
+    """Runner for plain Python callables."""
+
+    def __init__(
+        self,
+        func: Callable[..., Any],
+        *,
+        name: str,
+        output_keys: Sequence[str],
+        call_defaults: Optional[Mapping[str, Any]] = None,
+    ):
+        super().__init__(name=name)
+        self._func = func
+        self._output_keys = list(output_keys)
+        self._call_defaults = dict(call_defaults or {})
+
+    def compute(self, **kwargs) -> Mapping[str, Any]:
+        call_kwargs = {**self._call_defaults, **kwargs}
+        result = self._func(**call_kwargs)
+        return _normalise_output(result, self._output_keys)
+
+
+class ClassRunner(OperatorRunner):
+    """Runner for class instances exposing a forward-like method."""
+
+    def __init__(
+        self,
+        *,
+        instance: Any,
+        forward: Callable[..., Any],
+        name: str,
+        output_keys: Sequence[str],
+        call_defaults: Optional[Mapping[str, Any]] = None,
+    ):
+        super().__init__(name=name)
+        self._instance = instance
+        self._forward = forward
+        self._output_keys = list(output_keys)
+        self._call_defaults = dict(call_defaults or {})
+
+    def compute(self, **kwargs) -> Mapping[str, Any]:
+        call_kwargs = {**self._call_defaults, **kwargs}
+        result = self._forward(**call_kwargs)
+        return _normalise_output(result, self._output_keys)
+
+
+class GraphOperatorRunner(OperatorRunner):
+    """Runner that delegates execution to an embedded graph runtime."""
+
+    def __init__(
+        self,
+        *,
+        runtime: "GraphRuntime",
+        name: str,
+        output_keys: Sequence[str],
+    ):
+        super().__init__(name=name)
+        self._runtime = runtime
+        self._output_keys = list(output_keys)
+
+    def compute(self, **kwargs) -> Mapping[str, Any]:
+        return self._runtime.run(kwargs, outputs=self._output_keys)
+
+
+@dataclass(frozen=True)
+class OperatorTemplate:
+    """Factory descriptor for runnable operator instances."""
+
+    name: str
+    create_runner: Callable[[Mapping[str, Any], str], OperatorRunner]
+    input_ports: Mapping[str, PortDefinition] = field(default_factory=dict)
+    output_ports: Mapping[str, PortDefinition] = field(default_factory=dict)
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def instantiate(
+        self,
+        *,
+        config: Optional[Mapping[str, Any]] = None,
+        runtime_id: Optional[str] = None,
+    ) -> OperatorRunner:
+        runner = self.create_runner(dict(config or {}), runtime_id or self.name)
+        if not isinstance(runner, OperatorRunner):
+            raise RegistrationError(
+                f"Operator template '{self.name}' produced an invalid runner: "
+                f"{type(runner)!r}"
+            )
+        return runner
+
+    @classmethod
+    def from_function(
+        cls,
+        func: Callable[..., Any],
+        *,
+        name: Optional[str] = None,
+        outputs: Optional[Union[Sequence[str], Mapping[str, Any]]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> "OperatorTemplate":
+        if not callable(func):
+            raise RegistrationError(f"Expected callable, got {type(func)!r}")
+
+        signature = inspect.signature(func)
+        input_ports = _infer_input_ports(signature)
+        output_ports, output_keys = _infer_output_ports(
+            func, explicit=outputs
+        )
+
+        def factory(config: Mapping[str, Any], runtime_id: str) -> OperatorRunner:
+            call_defaults = dict(config)
+            return FunctionRunner(
+                func,
+                name=runtime_id or func.__name__,
+                output_keys=output_keys,
+                call_defaults=call_defaults,
+            )
+
+        return cls(
+            name=name or func.__name__,
+            create_runner=factory,
+            input_ports=MappingProxyType(input_ports),
+            output_ports=MappingProxyType(output_ports),
+            metadata=MappingProxyType(dict(metadata or {})),
+        )
+
+    @classmethod
+    def from_class(
+        cls,
+        operator_cls: type,
+        *,
+        name: Optional[str] = None,
+        forward: str = "forward",
+        outputs: Optional[Union[Sequence[str], Mapping[str, Any]]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> "OperatorTemplate":
+        if not inspect.isclass(operator_cls):
+            raise RegistrationError(f"Expected class type, got {type(operator_cls)!r}")
+
+        if not hasattr(operator_cls, forward):
+            raise RegistrationError(
+                f"Operator class '{operator_cls.__name__}' missing '{forward}' method"
+            )
+
+        forward_fn = getattr(operator_cls, forward)
+        forward_sig = inspect.signature(forward_fn)
+        init_sig = inspect.signature(operator_cls.__init__)
+
+        input_ports = _infer_input_ports(forward_sig, skip_first=True)
+        output_ports, output_keys = _infer_output_ports(
+            forward_fn, explicit=outputs
+        )
+        init_defaults = _infer_default_kwargs(init_sig, skip_first=True)
+
+        def factory(config: Mapping[str, Any], runtime_id: str) -> OperatorRunner:
+            cfg = dict(config)
+            init_kwargs = dict(init_defaults)
+            call_defaults: Dict[str, Any] = {}
+
+            if "init" in cfg:
+                init_kwargs.update(_ensure_mapping(cfg.pop("init"), "init"))
+            if "call" in cfg:
+                call_defaults.update(_ensure_mapping(cfg.pop("call"), "call"))
+
+            init_kwargs.update(cfg)
+
+            instance = operator_cls(**init_kwargs)
+            forward_method = getattr(instance, forward)
+            return ClassRunner(
+                instance=instance,
+                forward=forward_method,
+                name=runtime_id or operator_cls.__name__,
+                output_keys=output_keys,
+                call_defaults=call_defaults,
+            )
+
+        return cls(
+            name=name or operator_cls.__name__,
+            create_runner=factory,
+            input_ports=MappingProxyType(input_ports),
+            output_ports=MappingProxyType(output_ports),
+            metadata=MappingProxyType(dict(metadata or {})),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Graph specification
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class NodeSpec:
+    """Declarative node descriptor."""
+
+    id: str
+    operator: str
+    config: Mapping[str, Any] = field(default_factory=dict)
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class EdgeSpec:
+    """Declarative edge descriptor (src and dst use '<node>.<port>' syntax)."""
+
+    src: str
+    dst: str
+
+    def unpack(self) -> Tuple[Tuple[str, str], Tuple[str, str]]:
+        return _parse_endpoint(self.src), _parse_endpoint(self.dst)
+
+
+@dataclass(frozen=True)
+class GraphSpec:
+    """Top-level graph declaration."""
+
+    nodes: Mapping[str, NodeSpec]
+    edges: Sequence[EdgeSpec]
+    inputs: Mapping[str, str] = field(default_factory=dict)
+    outputs: Mapping[str, str] = field(default_factory=dict)
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class GraphInputRef:
+    """Reference to a named graph input."""
+
+    name: str
+
+
+@dataclass(frozen=True)
+class NodeOutputRef:
+    """Reference to a node output port."""
+
+    node_id: str
+    port: str
+
+
+# ---------------------------------------------------------------------------
+# Graph runtime
+# ---------------------------------------------------------------------------
+
+
+class NodeRuntime:
+    """Runtime node holding instantiated operator."""
+
+    def __init__(
+        self,
+        node_id: str,
+        template: OperatorTemplate,
+        runner: OperatorRunner,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ):
+        self.id = node_id
+        self.template = template
+        self.runner = runner
+        self.metadata = dict(metadata or {})
+        self.input_ports = dict(template.input_ports)
+        self.output_ports = dict(template.output_ports)
+
+    def run(self, **kwargs) -> Dict[str, Any]:
+        return self.runner(**kwargs)
+
+
+class GraphRuntime:
+    """Executable graph produced from a GraphSpec."""
+
+    def __init__(
+        self,
+        *,
+        spec: GraphSpec,
+        node_runtimes: Mapping[str, NodeRuntime],
+        inbound: Mapping[str, Dict[str, Union[GraphInputRef, NodeOutputRef]]],
+        graph_inputs: Mapping[str, Tuple[str, str]],
+        graph_outputs: Mapping[str, NodeOutputRef],
+        adjacency: Mapping[str, Set[str]],
+        topo_order: Sequence[str],
+    ):
+        self.spec = spec
+        self.node_runtimes = dict(node_runtimes)
+        self._inbound = {
+            node_id: dict(port_map) for node_id, port_map in inbound.items()
+        }
+        self.graph_inputs = dict(graph_inputs)
+        self.graph_outputs = dict(graph_outputs)
+        self._adjacency = {node: set(targets) for node, targets in adjacency.items()}
+        self.topological_order = list(topo_order)
+
+    def run(
+        self,
+        inputs: Optional[Mapping[str, Any]] = None,
+        *,
+        outputs: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Any]:
+        inputs = inputs or {}
+        missing_inputs = [
+            name for name in self.graph_inputs if name not in inputs
+        ]
+        if missing_inputs:
+            raise ExecutionError(
+                f"Missing required graph inputs: {', '.join(sorted(missing_inputs))}"
+            )
+
+        requested = list(outputs) if outputs is not None else list(self.graph_outputs)
+        undefined = [name for name in requested if name not in self.graph_outputs]
+        if undefined:
+            raise ExecutionError(
+                f"Requested outputs not defined: {', '.join(sorted(undefined))}"
+            )
+
+        state = _ExecutionState(self, inputs)
+        state.execute()
+
+        results: Dict[str, Any] = {}
+        for alias in requested:
+            out_ref = self.graph_outputs[alias]
+            node_outputs = state.node_values[out_ref.node_id]
+            if out_ref.port not in node_outputs:
+                raise ExecutionError(
+                    f"Node '{out_ref.node_id}' did not produce output '{out_ref.port}'"
+                )
+            results[alias] = node_outputs[out_ref.port]
+        return results
+
+    def describe(self) -> Dict[str, Any]:
+        """Return a serialisable view of the runtime for inspection/UI."""
+        return {
+            "nodes": {
+                node_id: {
+                    "operator": runtime.template.name,
+                    "inputs": list(runtime.input_ports.keys()),
+                    "outputs": list(runtime.output_ports.keys()),
+                    "metadata": runtime.metadata,
+                }
+                for node_id, runtime in self.node_runtimes.items()
+            },
+            "edges": [
+                {
+                    "src": f"{ref.node_id}.{ref.port}",
+                    "dst": f"{node_id}.{port}",
+                }
+                for node_id, port_map in self._inbound.items()
+                for port, ref in port_map.items()
+                if isinstance(ref, NodeOutputRef)
+            ],
+            "inputs": dict(self.graph_inputs),
+            "outputs": {
+                alias: f"{ref.node_id}.{ref.port}"
+                for alias, ref in self.graph_outputs.items()
+            },
+        }
+
+
+class _ExecutionState:
+    """Per-run execution helper."""
+
+    def __init__(self, runtime: GraphRuntime, external_inputs: Mapping[str, Any]):
+        self.runtime = runtime
+        self.external_inputs = dict(external_inputs)
+        self.node_values: Dict[str, Dict[str, Any]] = {}
+
+    def execute(self) -> None:
+        for node_id in self.runtime.topological_order:
+            runtime_node = self.runtime.node_runtimes[node_id]
+            kwargs = self._collect_inputs(node_id, runtime_node)
+            outputs = runtime_node.run(**kwargs)
+            self.node_values[node_id] = outputs
+
+    def _collect_inputs(
+        self,
+        node_id: str,
+        runtime_node: NodeRuntime,
+    ) -> Dict[str, Any]:
+        inbound = self.runtime._inbound.get(node_id, {})
+        kwargs: Dict[str, Any] = {}
+
+        for port_name, ref in inbound.items():
+            if isinstance(ref, GraphInputRef):
+                kwargs[port_name] = self.external_inputs[ref.name]
+            else:
+                producer_outputs = self.node_values[ref.node_id]
+                kwargs[port_name] = producer_outputs[ref.port]
+
+        for port_name, port_def in runtime_node.input_ports.items():
+            if port_name not in kwargs and not port_def.required:
+                kwargs[port_name] = port_def.default
+
+        return kwargs
+
+
+# ---------------------------------------------------------------------------
+# Graph builder
+# ---------------------------------------------------------------------------
+
+
+class GraphBuilder:
+    """Materialises GraphRuntime instances from specs."""
+
+    def __init__(self, registry: Optional["OperatorRegistry"] = None):
+        self.registry = registry or registry_default
+
+    def build(self, spec: GraphSpec) -> GraphRuntime:
+        if not spec.nodes:
+            raise GraphBuildError("GraphSpec must contain at least one node")
+
+        node_runtimes: Dict[str, NodeRuntime] = {}
+        inbound: Dict[str, Dict[str, Union[GraphInputRef, NodeOutputRef]]] = defaultdict(dict)
+        adjacency: Dict[str, Set[str]] = defaultdict(set)
+        in_degree: Dict[str, int] = defaultdict(int)
+
+        for node_id, node_spec in spec.nodes.items():
+            if node_id in node_runtimes:
+                raise GraphBuildError(f"Duplicate node id '{node_id}' in GraphSpec")
+            template = self.registry.get(node_spec.operator)
+            runner = template.instantiate(config=node_spec.config, runtime_id=node_id)
+            node_runtimes[node_id] = NodeRuntime(
+                node_id=node_id,
+                template=template,
+                runner=runner,
+                metadata=node_spec.metadata,
+            )
+            in_degree[node_id] = 0
+
+        graph_inputs: Dict[str, Tuple[str, str]] = {}
+
+        for alias, endpoint in spec.inputs.items():
+            node_id, port = _parse_endpoint(endpoint)
+            if node_id not in node_runtimes:
+                raise GraphBuildError(
+                    f"Graph input '{alias}' targets unknown node '{node_id}'"
+                )
+            node_runtime = node_runtimes[node_id]
+            if port not in node_runtime.input_ports:
+                raise GraphBuildError(
+                    f"Graph input '{alias}' targets unknown input port "
+                    f"'{port}' on node '{node_id}'"
+                )
+            if port in inbound[node_id]:
+                raise GraphBuildError(
+                    f"Input port '{port}' on node '{node_id}' already bound"
+                )
+            inbound[node_id][port] = GraphInputRef(alias)
+            graph_inputs[alias] = (node_id, port)
+
+        for edge in spec.edges:
+            (src_node, src_port), (dst_node, dst_port) = edge.unpack()
+            if src_node not in node_runtimes:
+                raise GraphBuildError(f"Edge source node '{src_node}' not found")
+            if dst_node not in node_runtimes:
+                raise GraphBuildError(f"Edge target node '{dst_node}' not found")
+
+            src_runtime = node_runtimes[src_node]
+            dst_runtime = node_runtimes[dst_node]
+
+            if src_port not in src_runtime.output_ports:
+                raise GraphBuildError(
+                    f"Edge references unknown output port '{src_port}' on node '{src_node}'"
+                )
+            if dst_port not in dst_runtime.input_ports:
+                raise GraphBuildError(
+                    f"Edge references unknown input port '{dst_port}' on node '{dst_node}'"
+                )
+            if dst_port in inbound[dst_node]:
+                raise GraphBuildError(
+                    f"Input port '{dst_port}' on node '{dst_node}' already bound"
+                )
+
+            inbound[dst_node][dst_port] = NodeOutputRef(src_node, src_port)
+            adjacency[src_node].add(dst_node)
+            in_degree[dst_node] += 1
+
+        # Validate required ports
+        for node_id, runtime in node_runtimes.items():
+            for port_name, port_def in runtime.input_ports.items():
+                if port_name not in inbound[node_id] and port_def.required:
+                    raise GraphBuildError(
+                        f"Required input '{port_name}' on node '{node_id}' "
+                        "is not connected and has no default value"
+                    )
+
+        if not spec.outputs:
+            raise GraphBuildError("GraphSpec must declare at least one output")
+
+        graph_outputs: Dict[str, NodeOutputRef] = {}
+        for alias, endpoint in spec.outputs.items():
+            node_id, port = _parse_endpoint(endpoint)
+            if node_id not in node_runtimes:
+                raise GraphBuildError(
+                    f"Graph output '{alias}' targets unknown node '{node_id}'"
+                )
+            node_runtime = node_runtimes[node_id]
+            if port not in node_runtime.output_ports:
+                raise GraphBuildError(
+                    f"Graph output '{alias}' references unknown port '{port}' "
+                    f"on node '{node_id}'"
+                )
+            graph_outputs[alias] = NodeOutputRef(node_id, port)
+
+        topo_order = _topological_sort(node_runtimes.keys(), adjacency, in_degree)
+
+        return GraphRuntime(
+            spec=spec,
+            node_runtimes=node_runtimes,
+            inbound=inbound,
+            graph_inputs=graph_inputs,
+            graph_outputs=graph_outputs,
+            adjacency=adjacency,
+            topo_order=topo_order,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Operator registry and decorators
+# ---------------------------------------------------------------------------
+
+
+class OperatorRegistry:
+    """Registry mapping operator names to templates."""
+
+    def __init__(self):
+        self._operators: Dict[str, OperatorTemplate] = {}
+
+    def register(self, template: OperatorTemplate) -> OperatorTemplate:
+        if template.name in self._operators:
+            raise RegistrationError(
+                f"Operator '{template.name}' already registered"
+            )
+        self._operators[template.name] = template
+        return template
+
+    def register_function(
+        self,
+        func: Optional[Callable[..., Any]] = None,
+        *,
+        name: Optional[str] = None,
+        outputs: Optional[Union[Sequence[str], Mapping[str, Any]]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ):
+        if func is None:
+            def wrapper(f: Callable[..., Any]) -> Callable[..., Any]:
+                self.register_function(
+                    f, name=name, outputs=outputs, metadata=metadata
+                )
+                return f
+
+            return wrapper
+
+        template = OperatorTemplate.from_function(
+            func, name=name, outputs=outputs, metadata=metadata
+        )
+        self.register(template)
+        return func
+
+    def register_class(
+        self,
+        cls: Optional[type] = None,
+        *,
+        name: Optional[str] = None,
+        forward: str = "forward",
+        outputs: Optional[Union[Sequence[str], Mapping[str, Any]]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ):
+        if cls is None:
+            def wrapper(klass: type) -> type:
+                self.register_class(
+                    klass,
+                    name=name,
+                    forward=forward,
+                    outputs=outputs,
+                    metadata=metadata,
+                )
+                return klass
+
+            return wrapper
+
+        template = OperatorTemplate.from_class(
+            cls,
+            name=name,
+            forward=forward,
+            outputs=outputs,
+            metadata=metadata,
+        )
+        self.register(template)
+        return cls
+
+    def register_graph(
+        self,
+        name: str,
+        graph_spec: GraphSpec,
+        *,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> OperatorTemplate:
+        input_defs = {
+            alias: PortDefinition(name=alias)
+            for alias in graph_spec.inputs.keys()
+        }
+        output_defs = {}
+        for alias in graph_spec.outputs.keys():
+            output_defs[alias] = PortDefinition(name=alias)
+
+        def factory(config: Mapping[str, Any], runtime_id: str) -> OperatorRunner:
+            builder = GraphBuilder(self)
+            runtime = builder.build(graph_spec)
+            return GraphOperatorRunner(
+                runtime=runtime,
+                name=runtime_id or name,
+                output_keys=list(graph_spec.outputs.keys()),
+            )
+
+        template = OperatorTemplate(
+            name=name,
+            create_runner=factory,
+            input_ports=MappingProxyType(input_defs),
+            output_ports=MappingProxyType(output_defs),
+            metadata=MappingProxyType(dict(metadata or {})),
+        )
+        return self.register(template)
+
+    def get(self, name: str) -> OperatorTemplate:
+        try:
+            return self._operators[name]
+        except KeyError as exc:
+            raise RegistrationError(f"Unknown operator '{name}'") from exc
+
+    def __contains__(self, name: str) -> bool:  # pragma: no cover
+        return name in self._operators
+
+    def items(self) -> Iterable[Tuple[str, OperatorTemplate]]:  # pragma: no cover
+        return self._operators.items()
+
+
+registry_default = OperatorRegistry()
+
+
+def register_function(
+    func: Optional[Callable[..., Any]] = None,
+    *,
+    name: Optional[str] = None,
+    outputs: Optional[Union[Sequence[str], Mapping[str, Any]]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+):
+    return registry_default.register_function(
+        func, name=name, outputs=outputs, metadata=metadata
+    )
+
+
+def register_class(
+    cls: Optional[type] = None,
+    *,
+    name: Optional[str] = None,
+    forward: str = "forward",
+    outputs: Optional[Union[Sequence[str], Mapping[str, Any]]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+):
+    return registry_default.register_class(
+        cls,
+        name=name,
+        forward=forward,
+        outputs=outputs,
+        metadata=metadata,
+    )
+
+
+def register_graph(
+    name: str,
+    graph_spec: GraphSpec,
+    *,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> OperatorTemplate:
+    return registry_default.register_graph(
+        name, graph_spec, metadata=metadata
+    )
+
+
+def build_graph(
+    spec: GraphSpec,
+    *,
+    registry: Optional[OperatorRegistry] = None,
+) -> GraphRuntime:
+    builder = GraphBuilder(registry or registry_default)
+    return builder.build(spec)
+
+
+def returns_keys(**outputs: Any):
+    """
+    Decorator recording explicit output names (and optional type hints).
+
+    Example::
+
+        @returns_keys(result=int, remainder=int)
+        def divide(a: int, b: int):
+            return {"result": a // b, "remainder": a % b}
+    """
+
+    def decorator(obj: Callable[..., Any]) -> Callable[..., Any]:
+        obj.__dag_returns__ = dict(outputs)
+        return obj
+
     return decorator
 
 
-class Module(Node, Debug):
-    def __init__(
-        self, 
-        name: str = None, 
-        parent: Optional['Module'] = None,
-        indirect = None,
-        outdirect = None,
-        **kwargs
-    ):
-        Node.__init__(self, name, **kwargs)
-        Debug.__init__(self)
-        self.parent = parent
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-        self.indirect = indirect
-        self.outdirect = outdirect
+def _infer_input_ports(
+    signature: inspect.Signature,
+    *,
+    skip_first: bool = False,
+) -> Dict[str, PortDefinition]:
+    parameters = list(signature.parameters.values())
+    if skip_first and parameters:
+        parameters = parameters[1:]
 
-        self._prev: Dict[str, Edge] = {}
-        self._next: Dict[str, List[Edge]] = defaultdict(list)
-        self._default_values: Dict[str, Any] = {}
-
-        self.use_default_return = True
-
-    def __repr__(self):
-        return super().__repr__()
-    
-    def extra_repr(self):
-        return f"parent={self.parent}, prev={self._prev}, next={self._next}"
-
-    @staticmethod
-    def infer_input_parameters(func: Callable) -> Tuple[List[str], Dict[str, Any]]:
-        """
-        Infer input parameters from a callable function.
-        
-        Args:
-            func: The callable function to inspect
-            
-        Returns:
-            Tuple of (parameter_names, default_values)
-            - parameter_names: List of parameter names (excluding self, *args, **kwargs)
-            - default_values: Dict mapping parameter names to their default values
-        """
-        func_signature = inspect.signature(func)
-        parameters = list(func_signature.parameters.keys())
-        
-        # Remove 'self' parameter if present
-        if parameters and parameters[0] == 'self':
-            parameters = parameters[1:]
-
-        # Filter out *args and **kwargs parameters, collect defaults
-        filtered_parameters = []
-        default_values = {}
-        
-        for param in parameters:
-            param_obj = func_signature.parameters[param]
-            param_kind = param_obj.kind
-            
-            if (param_kind != inspect.Parameter.VAR_POSITIONAL and 
-                param_kind != inspect.Parameter.VAR_KEYWORD):
-                filtered_parameters.append(param)
-                
-                # Check if parameter has a default value
-                if param_obj.default != inspect.Parameter.empty:
-                    default_values[param] = param_obj.default
-        
-        return filtered_parameters, default_values
-
-    @staticmethod
-    def infer_output_keys(func: Callable) -> Tuple[List[str], bool]:
-        """
-        Infer output keys from a callable function.
-        
-        Args:
-            func: The callable function to inspect
-            
-        Returns:
-            Tuple of (output_keys, use_default_return)
-            - output_keys: List of output key names
-            - use_default_return: Whether to use default return behavior
-        """
-        output_keys = ["_return"]
-        use_default_return = True
-        
-        if hasattr(func, '__returns_keys__'):
-            output_keys = list(func.__returns_keys__.keys())
-            use_default_return = False
-            
-        return output_keys, use_default_return
-
-    def __call__(self, *args, **kwargs):
-        # Check if debugging is enabled
-        if get_debug_state():
-            self._start_timer()
-            
-        # Check for cached results
-        if all(edge.is_cached for edges in self._next.values() if edges for edge in edges):
-            results = {}
-            for k, edges in self._next.items():
-                if not edges:
-                    warnings.warn(f"Empty edge list found for key {k}", UserWarning)
-                    continue
-                results[k] = edges[0].__call__()
-                
-            # Log time for cached execution if debugging is enabled
-            if get_debug_state():
-                elapsed = self._stop_timer()
-                print(f"[DEBUG] Module {self.name} returned cached result in {elapsed:.6f}s")
-                
-            return results
-
-        # Prepare inputs
-        self.prepare()
-        
-        # Execute forward computation
-        forward_kwargs = {}
-        for k, edge in self._prev.items():
-            if edge.is_cached and edge.is_active:
-                forward_kwargs[k] = edge.__call__()
-            elif k in self._default_values:
-                forward_kwargs[k] = self._default_values[k]
-        
-        forward_results = self.forward(**forward_kwargs)
-        
-        # Process results
-        if self.use_default_return and not isinstance(forward_results, dict):
-            results = {"_return": forward_results}
-        else:
-            results = forward_results
-
-        # Update output edges
-        for _next_k, res in results.items():
-            if _next_k in self._next:
-                for _next_edge in self._next[_next_k]:
-                    _next_edge._cache = res
-                    _next_edge.is_cached = True
-            else:
-                warnings.warn(f"Output key {_next_k} not found in next edges", UserWarning)
-        
-        # Log execution time if debugging is enabled
-        if get_debug_state():
-            elapsed = self._stop_timer()
-            print(f"[DEBUG] Module {self.name} executed in {elapsed:.6f}s")
-            
-        return results
-    
-    @property
-    def num_entries(self):
-        return self.indirect or len(self._prev)
-    
-    @property
-    def undefined_entries(self):
-        return 0 if self.indirect is None else sum(edge.null for edge in self._prev.values())
-
-    def prepare(self):
-        for _prev_k, prev_edge in self._prev.items():
-            if prev_edge.null:
-                # Check if parameter has default value or edge is inactive
-                if _prev_k in self._default_values or not prev_edge.is_active:
-                    continue  # Skip error for parameters with defaults or inactive edges
-                else:
-                    raise ValueError(f"Undefined input: {prev_edge.name}")
-            if prev_edge.virtual:
-                # Find the mapping using new tuple format
-                for group_key, (module_name, module_key) in self.parent._prev_name_map.items():
-                    if (module_name, module_key) == (self.name, _prev_k):
-                        prev_edge._cache = self.parent._prev[group_key].cache
-                        prev_edge.is_cached = True
-                        break
-                else:
-                    raise RuntimeError(f"Virtual edge mapping not found for {self.name}.{_prev_k}")
-            else:
-                prev_edge.src()
-
-    @abstractmethod
-    def forward(self, **kwargs) -> Optional[Dict[str, Any]]:
-        raise NotImplementedError
+    ports: Dict[str, PortDefinition] = {}
+    for param in parameters:
+        if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+            raise RegistrationError(
+                "Variable positional or keyword arguments are not supported "
+                "in operator signatures"
+            )
+        annotation = param.annotation if param.annotation is not inspect._empty else Any
+        default = param.default if param.default is not inspect._empty else _NO_DEFAULT
+        ports[param.name] = PortDefinition(
+            name=param.name,
+            type=annotation,
+            default=default,
+        )
+    return ports
 
 
-class FunctionModule(Module):
-    def __init__(
-        self,
-        func: callable,
-        name: str = None,
-        parent: Optional['Module'] = None,
-        **kwargs
-    ):
-        if not callable(func):
-            raise TypeError(f"func must be callable, got {type(func)}")
+def _infer_output_ports(
+    obj: Callable[..., Any],
+    *,
+    explicit: Optional[Union[Sequence[str], Mapping[str, Any]]] = None,
+) -> Tuple[Dict[str, PortDefinition], List[str]]:
+    if explicit is not None:
+        ports = _normalise_output_definitions(explicit)
+        return ports, list(ports.keys())
 
-        self.func = func
-        self.func_signature = inspect.signature(func)
+    annotated = getattr(obj, "__dag_returns__", None)
+    if annotated is not None:
+        ports = _normalise_output_definitions(annotated)
+        return ports, list(ports.keys())
 
-        # Use static methods for inference
-        filtered_parameters, default_values = self.infer_input_parameters(func)
-        output_keys, use_default_return = self.infer_output_keys(func)
-        
-        indirect = len(filtered_parameters)
-        outdirect = len(output_keys)
+    return {
+        "_return": PortDefinition(name="_return"),
+    }, ["_return"]
 
-        super().__init__(name=name, parent=parent, indirect=indirect, outdirect=outdirect, **kwargs)
-        
-        # Set use_default_return based on inference
-        self.use_default_return = use_default_return
 
-        # Set default values
-        self._default_values = default_values
+def _infer_default_kwargs(
+    signature: inspect.Signature,
+    *,
+    skip_first: bool = False,
+) -> Dict[str, Any]:
+    parameters = list(signature.parameters.values())
+    if skip_first and parameters:
+        parameters = parameters[1:]
 
-        # Initialize input edges
-        for param in filtered_parameters:
-            self._prev[param] = Edge(name=param)
-        
-        # Initialize output edges
-        for output in output_keys:
-            self._next[output] = [Edge(name=output)]
+    defaults: Dict[str, Any] = {}
+    for param in parameters:
+        if param.default is not inspect._empty:
+            defaults[param.name] = param.default
+    return defaults
 
-    def extra_repr(self):
-        return f"func={self.func.__name__}, parent={self.parent}, prev={self._prev}, next={self._next}"
 
-    def forward(self, **kwargs) -> Any:
-        filtered_args = {
-            name: kwargs[name]
-            for name in self.func_signature.parameters
-            if name in kwargs
+def _parse_endpoint(value: str) -> Tuple[str, str]:
+    if "." not in value:
+        raise GraphBuildError(
+            f"Endpoint '{value}' must use '<node>.<port>' notation"
+        )
+    node_id, port = value.split(".", 1)
+    if not node_id or not port:
+        raise GraphBuildError(
+            f"Endpoint '{value}' must include both node id and port"
+        )
+    return node_id, port
+
+
+def _normalise_output_definitions(
+    value: Union[Sequence[str], Mapping[str, Any]]
+) -> Dict[str, PortDefinition]:
+    if isinstance(value, Mapping):
+        return {
+            name: PortDefinition(
+                name=name,
+                type=type_hint if type_hint is not None else Any,
+            )
+            for name, type_hint in value.items()
         }
-        return self.func(**filtered_args)
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return {name: PortDefinition(name=name) for name in value}
+    raise RegistrationError(
+        "Output definition should be a mapping (name->type) or sequence of names"
+    )
 
 
-class InspectModule(Module):
-    def __init__(self, name: str = None, parent: Optional['Module'] = None, **kwargs):
-        super().__init__(name, parent, **kwargs)
-        
-        # Use static methods for inference
-        filtered_parameters, default_values = self.infer_input_parameters(self.forward)
-        output_keys, use_default_return = self.infer_output_keys(self.forward)
-        
-        self.indirect = len(filtered_parameters)
-        self.outdirect = len(output_keys)
-        
-        # Set use_default_return based on inference
-        self.use_default_return = use_default_return
+def _normalise_output(
+    value: Any,
+    output_keys: Sequence[str],
+) -> Dict[str, Any]:
+    keys = list(output_keys)
+    if isinstance(value, Mapping):
+        if keys and any(key not in value for key in keys):
+            missing = [key for key in keys if key not in value]
+            raise ExecutionError(
+                f"Operator result missing keys: {', '.join(missing)}"
+            )
+        return dict(value)
 
-        # Set default values
-        self._default_values = default_values
+    if hasattr(value, "_asdict"):
+        mapped = value._asdict()  # type: ignore[attr-defined]
+        return _normalise_output(mapped, keys)
 
-        # Initialize input edges
-        for param in filtered_parameters:
-            self._prev[param] = Edge(name=param)
-        
-        # Initialize output edges
-        for key in output_keys:
-            self._next[key] = [Edge(name=key)]
+    if len(keys) == 1:
+        return {keys[0]: value}
 
-    def __call__(self, *args, **kwargs):
-        return super().__call__(*args, **kwargs)
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        if len(value) != len(keys):
+            raise ExecutionError(
+                f"Expected {len(keys)} outputs, received {len(value)}"
+            )
+        return dict(zip(keys, value))
 
-
-class ModuleGroup(Module):
-    def __init__(self, name: str = None, parent: Optional['Module'] = None, modules: List[Module] = [], **kwargs):
-        super().__init__(name, parent, **kwargs)
-        self._modules: Dict[str, Module] = {}
-        self._next_name_map = {}
-        self._prev_name_map = {}
-
-        if modules:
-            self.initialize(modules)
-
-    def initialize(self, modules: List[Module] = []):
-        if not modules:
-            return
-        
-        for module in modules:
-            if not isinstance(module, Module):
-                raise TypeError(f"Expected Module instance, got {type(module)}")
-            module.parent = self
-
-            if module.name in self._modules: # TODO change the logic of repeat name
-                raise ValueError(f"Module with name {module.name} already exists in the group.")
-                # warnings.warn(f"Module with name {module.name} already exists in the group.", UserWarning)
-            self._modules[module.name] = module
-    
-        def parse_key(key: str) -> Tuple[str, int]:
-            if '.' in key:
-                parts = key.split('.')
-                try:
-                    return parts[0], int(parts[1])
-                except (ValueError, IndexError):
-                    return key, 1
-            return key, 1
-        
-        def create_key_generators(keys: List[str]) -> Dict[str, Callable[[], str]]:
-            root_groups = defaultdict(list)
-            for key in keys:
-                root, num = parse_key(key)
-                root_groups[root].append((key, num))
-            
-            key_generators = {}
-            for root, key_list in root_groups.items():
-                if len(key_list) == 1:
-                    key_generators[root] = lambda r=root: r
-                else:
-                    def make_generator(root_name):
-                        counter = 1
-                        def generator():
-                            nonlocal counter
-                            if counter == 1:
-                                result = root_name
-                            else:
-                                result = f"{root_name}.{counter}"
-                            counter += 1
-                            return result
-                        return generator
-                    key_generators[root] = make_generator(root)
-            
-            return key_generators
-
-        # Collect all keys that need group-level mapping
-        prev_keys_to_process = []
-        next_keys_to_process = []
-
-        for _, module in self._modules.items():
-            # Validate module name doesn't contain separator
-            if '.' in module.name:
-                raise ValueError(f"Module name '{module.name}' cannot contain '.' character as it's used as separator in mapping")
-            
-            for key, edge in module._prev.items():
-                if edge.null:
-                    prev_keys_to_process.append(key)
-
-            for key, edges in module._next.items():
-                for edge in edges:
-                    if edge.null:
-                        next_keys_to_process.append(key)
-                        break  # Only count once per key
-
-        # Create key generators to avoid conflicts
-        prev_key_generators = create_key_generators(prev_keys_to_process)
-        next_key_generators = create_key_generators(next_keys_to_process)
-
-        # Apply the reassigned keys
-        for _, module in self._modules.items():
-            for key, edge in module._prev.items():
-                if edge.null:
-                    root, _ = parse_key(key)
-                    group_key = prev_key_generators[root]()
-
-                    # Create mapping using tuple for robustness
-                    self._prev_name_map[group_key] = (module.name, key)
-
-                    # Create group input edge
-                    if group_key in self._prev:
-                        raise RuntimeError(f"Internal error: duplicate group key '{group_key}' should not occur with correct naming logic")
-                    
-                    self._prev[group_key] = Edge(name=group_key, tgt=self)
-
-                    # Set module edge to virtual
-                    module._prev[key] = Edge(
-                        name=key,
-                        src=VirtualNode,
-                        tgt=module,
-                        tgt_key=key
-                    )
-
-                    # Handle default values if they exist
-                    if key in module._default_values:
-                        self._default_values[group_key] = module._default_values[key]
-
-            for key, edges in module._next.items():
-                for idx, edge in enumerate(edges):
-                    if edge.null:
-                        root, _ = parse_key(key)
-                        group_key = next_key_generators[root]()
-
-                        # Create mapping using tuple for robustness
-                        self._next_name_map[group_key] = (module.name, key)
-                        
-                        # Create group output edge
-                        if group_key in self._next:
-                            raise RuntimeError(f"Internal error: duplicate group key '{group_key}' should not occur with correct naming logic")
-                            
-                        self._next[group_key] = [Edge(name=group_key, src=self, src_key=group_key)]
-
-                        # Set module edge to virtual
-                        module._next[key][idx] = Edge(
-                            name=key,
-                            src=module,
-                            tgt=VirtualNode,
-                            src_key=key,
-                        )
-                        break
-        
-        self.indirect = len(self._prev)
-        self.outdirect = len(self._next)
-
-    def forward(self, **kwargs) -> Any:
-        results = {}
-
-        module_set = set()
-        for map_key, (module_name, module_key) in self._next_name_map.items():
-            module_set.add(module_name)
-        
-        for module_name in module_set:
-            self._modules[module_name]()
-
-        for key, edges in self._next.items():
-            module_name, module_key = self._next_name_map[key]
-            results[key] = self._modules[module_name]._next[module_key][0].cache
-        return results
-
-def connect(
-    src: Union['Module', _PlaceholderNodeType] = NullNode, 
-    src_key: Optional[str] = None, 
-    tgt: Union['Module', _PlaceholderNodeType] = NullNode, 
-    tgt_key: Optional[str] = None,
-    name: Optional[str] = None
-):
-    if src is NullNode and tgt is NullNode:
-        raise ValueError("Both source and target are NullNodes")
-
-    # Validate src_key exists in source module
-    if hasattr(src, "_next") and src_key is not None:
-        if src_key not in src._next:
-            raise ValueError(f"Source key '{src_key}' not found in module '{src.name}'")
-    
-    # Validate tgt_key exists in target module
-    if hasattr(tgt, "_prev") and tgt_key is not None:
-        if tgt_key not in tgt._prev:
-            raise ValueError(f"Target key '{tgt_key}' not found in module '{tgt.name}'")
-    
-    name = name or f"{src_key} -> {tgt_key}"
-    new_edge = Edge(name, src=src, src_key=src_key, tgt=tgt, tgt_key=tgt_key)
-
-    if hasattr(src, "_next") and src_key is not None:
-        insert_idx = -1
-        for idx, edge in enumerate(src._next[src_key]):
-            if edge.null:
-                insert_idx = idx
-                break
-
-        if insert_idx == -1:
-            src._next[src_key].append(new_edge)
-        else:
-            edge = src._next[src_key][insert_idx]
-            edge.src = NullNode
-            edge.src_key = None
-
-            src._next[src_key][insert_idx] = new_edge
-
-    if hasattr(tgt, "_prev") and tgt_key is not None:
-        edge = tgt._prev[tgt_key]
-        edge.tgt = NullNode
-        edge.tgt_key = None
-
-        tgt._prev[tgt_key] = new_edge
+    raise ExecutionError(
+        "Unable to normalise operator output; provide explicit "
+        "returns_keys() metadata or return a mapping."
+    )
 
 
-def clear_cache(module: Module):
-    if not module._prev is None:
-        for edge in module._prev.values():
-            edge.is_cached = False
-            edge._cache = None
-
-    if not module._next is None:
-        for edges in module._next.values():
-            for edge in edges:
-                edge.is_cached = False
-                edge._cache = None
-    
-    if isinstance(module, ModuleGroup):
-        for child in module._modules.values():
-            clear_cache(child)
+def _ensure_mapping(value: Any, label: str) -> Mapping[str, Any]:
+    if isinstance(value, Mapping):
+        return value
+    raise RegistrationError(f"Expected mapping for '{label}' configuration")
 
 
-def get_module_stats(module: Module, recursive: bool = False) -> Dict[str, Any]:
-    stats = {module.name: module.get_stats()}
-    
-    if recursive and isinstance(module, ModuleGroup):
-        for name, submodule in module._modules.items():
-            substats = get_module_stats(submodule, recursive=True)
-            stats.update(substats)
-    
-    return stats
+def _topological_sort(
+    nodes: Iterable[str],
+    adjacency: Mapping[str, Set[str]],
+    in_degree: MutableMapping[str, int],
+) -> List[str]:
+    node_list = list(nodes)
+    queue = deque(node for node in node_list if in_degree[node] == 0)
+    order: List[str] = []
 
-def reset_module_stats(module: Module, recursive: bool = False) -> None:
-    module.reset_stats()
-    module.reset_stats()
-    
-    if recursive and isinstance(module, ModuleGroup):
-        for submodule in module._modules.values():
-            reset_module_stats(submodule, recursive=True)
+    while queue:
+        node = queue.popleft()
+        order.append(node)
+        for neighbour in adjacency.get(node, set()):
+            in_degree[neighbour] -= 1
+            if in_degree[neighbour] == 0:
+                queue.append(neighbour)
+
+    if len(order) != len(node_list):
+        raise GraphBuildError("Graph contains a cycle and cannot be executed")
+    return order
 
 
+# ---------------------------------------------------------------------------
+# Built-in operators registered on the default registry
+# ---------------------------------------------------------------------------
 
-# custom module for example
-class Constant(InspectModule):
-    def input(self, data: Any):
-        self._data = data
 
-    # default return with no typing decoration
+@register_class(name="constant")
+class Constant:
+    """Emit a constant value supplied via config."""
+
+    def __init__(self, value: Any):
+        self.value = value
+
     def forward(self) -> Any:
-        return self._data
+        return self.value
 
 
-class InspectConstant(InspectModule):
-    def input(self, data: Any):
-        self._data = data
-
-    # use typing decoration to specify the return type
-    @returns_keys(data=Any)
-    def forward(self):
-        return {"data": self._data}
+@register_function(name="addition")
+@returns_keys(result=float)
+def addition(a: float, b: float) -> float:
+    return a + b
 
 
-class Addition(InspectModule):
-    @returns_keys(result=int)
-    def forward(self, a: int, b: int): # simple addition module
-        return {"result": a + b}
+@register_function(name="multiplication")
+@returns_keys(result=float)
+def multiplication(a: float, b: float) -> float:
+    return a * b
 
 
-class Multiplication(InspectModule):
-    @returns_keys(result=int)
-    def forward(self, a: int, b: int): # simple multiplication module
-        return {"result": a * b}
+__all__ = [
+    "Constant",
+    "GraphBuilder",
+    "GraphRuntime",
+    "GraphSpec",
+    "NodeSpec",
+    "EdgeSpec",
+    "OperatorRegistry",
+    "OperatorTemplate",
+    "PortDefinition",
+    "build_graph",
+    "register_class",
+    "register_function",
+    "register_graph",
+    "returns_keys",
+    "registry_default",
+]
