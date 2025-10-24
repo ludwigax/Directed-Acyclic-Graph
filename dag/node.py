@@ -353,9 +353,43 @@ class NodeRuntime:
         self.metadata = dict(metadata or {})
         self.input_ports = dict(template.input_ports)
         self.output_ports = dict(template.output_ports)
+        cache_flag = self.metadata.get("cache_enabled", True)
+        if isinstance(cache_flag, bool):
+            self.cache_enabled = cache_flag
+        else:
+            self.cache_enabled = bool(cache_flag)
+        self._cache_valid = False
+        self._cache_inputs: Optional[Dict[str, Any]] = None
+        self._cache_outputs: Optional[Dict[str, Any]] = None
 
-    def run(self, **kwargs) -> Dict[str, Any]:
-        return self.runner(**kwargs)
+    def execute(
+        self,
+        inputs: Mapping[str, Any],
+        *,
+        use_cache: bool = True,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        inputs_dict = dict(inputs)
+        if self.cache_enabled and use_cache and not force:
+            if self._cache_valid and self._cache_inputs == inputs_dict:
+                return dict(self._cache_outputs or {})
+
+        outputs = self.runner(**inputs_dict)
+        outputs_dict = dict(outputs)
+
+        if self.cache_enabled:
+            self._cache_valid = True
+            self._cache_inputs = inputs_dict
+            self._cache_outputs = outputs_dict
+        else:
+            self.clear_cache()
+
+        return dict(outputs_dict)
+
+    def clear_cache(self) -> None:
+        self._cache_valid = False
+        self._cache_inputs = None
+        self._cache_outputs = None
 
 
 class GraphRuntime:
@@ -387,6 +421,8 @@ class GraphRuntime:
         inputs: Optional[Mapping[str, Any]] = None,
         *,
         outputs: Optional[Sequence[str]] = None,
+        use_cache: bool = True,
+        force_nodes: Optional[Iterable[str]] = None,
     ) -> Dict[str, Any]:
         inputs = inputs or {}
         missing_inputs = [
@@ -404,7 +440,9 @@ class GraphRuntime:
                 f"Requested outputs not defined: {', '.join(sorted(undefined))}"
             )
 
-        state = _ExecutionState(self, inputs)
+        force_set = set(force_nodes or [])
+
+        state = _ExecutionState(self, inputs, use_cache=use_cache, force_nodes=force_set)
         state.execute()
 
         results: Dict[str, Any] = {}
@@ -417,6 +455,15 @@ class GraphRuntime:
                 )
             results[alias] = node_outputs[out_ref.port]
         return results
+
+    def clear_cache(self, node_id: Optional[str] = None) -> None:
+        if node_id is None:
+            for runtime_node in self.node_runtimes.values():
+                runtime_node.clear_cache()
+        else:
+            if node_id not in self.node_runtimes:
+                raise ExecutionError(f"Unknown node '{node_id}' when clearing cache")
+            self.node_runtimes[node_id].clear_cache()
 
     def describe(self) -> Dict[str, Any]:
         """Return a serialisable view of the runtime for inspection/UI."""
@@ -450,16 +497,29 @@ class GraphRuntime:
 class _ExecutionState:
     """Per-run execution helper."""
 
-    def __init__(self, runtime: GraphRuntime, external_inputs: Mapping[str, Any]):
+    def __init__(
+        self,
+        runtime: GraphRuntime,
+        external_inputs: Mapping[str, Any],
+        *,
+        use_cache: bool,
+        force_nodes: Set[str],
+    ):
         self.runtime = runtime
         self.external_inputs = dict(external_inputs)
         self.node_values: Dict[str, Dict[str, Any]] = {}
+        self.use_cache = use_cache
+        self.force_nodes = force_nodes
 
     def execute(self) -> None:
         for node_id in self.runtime.topological_order:
             runtime_node = self.runtime.node_runtimes[node_id]
             kwargs = self._collect_inputs(node_id, runtime_node)
-            outputs = runtime_node.run(**kwargs)
+            outputs = runtime_node.execute(
+                kwargs,
+                use_cache=self.use_cache,
+                force=node_id in self.force_nodes,
+            )
             self.node_values[node_id] = outputs
 
     def _collect_inputs(
