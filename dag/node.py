@@ -205,7 +205,27 @@ class OperatorTemplate:
         )
 
         def factory(config: Mapping[str, Any], runtime_id: str) -> OperatorRunner:
-            call_defaults = dict(config)
+            cfg = dict(config or {})
+            call_defaults: Dict[str, Any] = {}
+
+            if "call" in cfg:
+                call_defaults.update(
+                    _ensure_mapping(cfg.pop("call"), "call defaults")
+                )
+
+            if "init" in cfg:
+                init_cfg = _ensure_mapping(cfg.pop("init"), "function init")
+                for key, value in init_cfg.items():
+                    if key in call_defaults:
+                        raise RegistrationError(
+                            f"Function operator '{func.__name__}' received "
+                            f"conflicting init/call default for '{key}'"
+                        )
+                    call_defaults[key] = value
+
+            for key, value in list(cfg.items()):
+                call_defaults.setdefault(key, value)
+
             return FunctionRunner(
                 func,
                 name=runtime_id or func.__name__,
