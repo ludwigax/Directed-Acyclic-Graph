@@ -315,7 +315,3 @@ def _format_mapping(mapping: Mapping[str, Any]) -> str:
 
 # Backwards compatibility -----------------------------------------------------------------
 
-
-def print_module(*args: Any, **kwargs: Any) -> None:
-    """Alias retained for older codepaths."""
-    print_runtime(*args, **kwargs)
