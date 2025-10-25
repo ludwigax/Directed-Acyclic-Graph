@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple
 
 from .node import EdgeSpec, GraphSpec, NodeSpec, registry_default
@@ -101,6 +102,9 @@ class OperatorsProxy:
             if self._registry.get(name) is not operator:
                 self._registry[name] = operator
                 self._cache.pop(name, None)
+
+    def has(self, name: str) -> bool:
+        return name in self._registry
 
     def __getattr__(self, name: str):
         if name in self._cache:
@@ -488,8 +492,9 @@ class DSLProgram:
         eval_locals["op"] = op
         eval_locals["ops"] = self._ops_namespace
         eval_locals["Ref"] = _RefResolver(self)
+        prepared_expr = self._prepare_operator_expr(expr, eval_globals, eval_locals)
         try:
-            return eval(expr, eval_globals, eval_locals)  # pylint: disable=eval-used
+            return eval(prepared_expr, eval_globals, eval_locals)  # pylint: disable=eval-used
         except Exception as exc:
             raise DSLEvaluationError(f"Failed to evaluate '{expr}': {exc}") from exc
 
@@ -544,6 +549,36 @@ class DSLProgram:
             return eval(expr, eval_globals, eval_locals)  # pylint: disable=eval-used
         except Exception as exc:
             raise DSLEvaluationError(f"Failed to evaluate default expression '{expr}': {exc}") from exc
+
+    def _prepare_operator_expr(
+        self,
+        expr: str,
+        globals_ctx: Mapping[str, Any],
+        locals_ctx: Mapping[str, Any],
+    ) -> str:
+        expression = expr.strip()
+        if not expression:
+            raise DSLEvaluationError("Empty operator expression")
+
+        # Expand bare operator names into ops.<name>()
+        if expression[0].isalpha() and "(" not in expression.split()[0]:
+            # Extract leading identifier
+            match = re.match(r"([A-Za-z_][A-Za-z0-9_]*)", expression)
+            if match:
+                name = match.group(1)
+                if not self._ops_namespace.has(name):
+                    raise DSLEvaluationError(
+                        f"Unknown operator '{name}'. Use 'ops.{name}' or register it first."
+                    )
+                rest = expression[len(name):].lstrip()
+                expression = f"ops.{name}{rest or '()'}"
+
+        # Normalise empty parentheses/brackets
+        expression = expression.replace("(*)", "()")
+        expression = re.sub(r"\(\s*\)", "()", expression)
+        expression = re.sub(r"\[\s*\]", "", expression)
+
+        return expression
 
     def _finalise_inputs(
         self,
