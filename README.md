@@ -71,6 +71,48 @@ normalize_workflow = GraphSpec.from_dict(
 
 ---
 
+## Parameterised Graphs
+
+Expose knobs for callers by declaring parameters. Operators read the parameter values via `ParameterRefValue`, and `build_graph` accepts overrides when instantiating the runtime.
+
+```python
+from dag.node import GraphSpec, ParameterRefValue, build_graph
+
+scaler_spec = GraphSpec.from_dict(
+    {
+        "parameters": {"scale": {"default": 2.0}},
+        "nodes": {
+            "mul": {
+                "operator": "multiplication",
+                "config": {"call": {"b": ParameterRefValue("scale")}},
+            }
+        },
+        "edges": [],
+        "inputs": {"value": "mul.a"},
+        "outputs": {"result": "mul.result"},
+    }
+)
+
+runtime = build_graph(scaler_spec, parameters={"scale": 5})
+print(runtime.run(inputs={"value": 4})["result"])  # 20
+```
+
+In the DSL the `parameter` keyword creates placeholders and `Param.<name>` injects them into operator configs (with optional defaults):
+
+```text
+graph scaler:
+    parameter scale
+    input value
+
+    mul = ops.multiplication(call={"b": Param.scale : 3})[a=value]
+
+    output result = mul.result
+```
+
+Nested graphs receive overrides via `Ref.scaler(scale=7)` or `Ref.scaler(parameters={"scale": 7})`.
+
+---
+
 ## Building & Running Graphs
 
 ```python
@@ -138,7 +180,7 @@ dsl_text = """
 graph scoring:
     input x, y
 
-    add = ops.addition[a=x, b=y]
+    add = ops.addition()[a=x, b=y]
     scale = ops.multiplication()[a=add.result, b=:0.5]
 
     output score = scale.result
@@ -148,6 +190,19 @@ program = parse_dsl(dsl_text, globals=globals(), locals=locals())
 spec = program.build("scoring")
 runtime = build_graph(spec)
 print(runtime.run(inputs={"x": 2, "y": 4}))
+```
+
+You can attach parameters in DSL just as in Python:
+
+```text
+graph tuned_scoring:
+    parameter weight
+    input x, y
+
+    base = Ref.scoring()[x=x, y=y]
+    adjust = ops.multiplication(call={"b": Param.weight : 0.2})[a=y]
+
+    output score = ops.addition()[a=base.score, b=adjust.result]
 ```
 
 The DSL shares the same registry as the Python API, so any decorated function/class is instantly available in `ops.*`. The generated `GraphSpec` can also be serialized, visualized, or embedded in other specs.

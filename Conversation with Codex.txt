@@ -1,0 +1,27 @@
+wait wait wait,
+我感觉你的DSL语言好像理解有误，我不确定你是怎么想的因此我需要纠正一下。我会通过这个文件向你传达信息，但你无需在这个文件中回复，你只需要在面板中回复。
+首先一个节点可能是func， class或者graphruntime。
+其中func无需实例化，class和graphruntime则需要实例化，这意味着func仅需call_defaults。 而class和graphruntime需要init ,而graphruntime甚至需要init_defaults.
+他的逻辑是这样的，任意的template通过工厂函数传递一个config。config包含两个基本的键init和call。用于指定初始化参数和默认run的实参。而我提到graphruntime甚至需要init_defaults是什么意思呢，即class的init函数中先天的自带了默认参数，看你是否指定，此时如果我们不传参他就会报错。而我们的graphruntime在spec中通过parameter指定初始化参数，因此同时就能方便的附带默认值。
+
+此时DSL语句中有方括号和圆括号，那么圆括号内就是实例化参数，方括号就是连接加传参。
+即我们应该满足node_1 = ops.func(*)[input_1 = node_0.result: var_0, input_2 =: var_1]
+其中var_0和var_1是python locals环境下的变量，指定了如果没有连接，节点执行时补充的默认参数。 而node_0.result则指定了一个节点的端口用于连接。
+其中(*)即函数不需要实例化参数。因此上述式子也可以写做node_1 = func[input_1=node_0.result:var_0, input_2=:var_1] 的轻量化写法。
+
+而当使用了一个类时，假定这个类是一个常量类，例如Pi，总是提供Pi常数
+GRAPH test
+    PARAMETER prec: 4
+    INPUT ....
+    ...
+    node_pi = Pi_constant(precision=Param.prec)
+可以看到，省略了默认执行参数，存在一个实例化参数，并把他委托给了节点属于的图。并指定了默认参数4
+
+然后在另一个图中，或者是我们希望运行的如main
+GRAPH main
+    ...
+    test = ops.test(prec=2)[...]
+你看我们就轻而易举的将一个计算图的参数精确位数更改为了2，甚至可以使用prec=Param.xxx进一步继承，或者使用来自python locals环境的var_xxx来指定，包装为一个python函数。
+
+截至现在你是否已经理解了我们DSL语言的特点了吗？你不得不承认，这样就灵活了很多了。
+请进行review，确保你我意图一致，此外建议DSL中的关键字必须要全大写，进行区分，我实际上不希望用户通过手写dict构造spec，DSL才是用户快速构造spec的范式。

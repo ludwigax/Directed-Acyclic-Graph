@@ -6,7 +6,14 @@ from dataclasses import dataclass, field
 import re
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple
 
-from .node import EdgeSpec, GraphSpec, NodeSpec, registry_default
+from .node import (
+    EdgeSpec,
+    GraphSpec,
+    NodeSpec,
+    ParameterRefValue,
+    ParameterSpec,
+    registry_default,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -39,8 +46,16 @@ class NodeDecl:
 
 
 @dataclass
+class ParameterDecl:
+    name: str
+    default_expr: Optional[str]
+    line: int
+
+
+@dataclass
 class GraphDecl:
     name: str
+    parameters: List[ParameterDecl] = field(default_factory=list)
     inputs: List[str] = field(default_factory=list)
     outputs: List[OutputDecl] = field(default_factory=list)
     nodes: List[NodeDecl] = field(default_factory=list)
@@ -64,6 +79,7 @@ class RefInvocation:
     graph_name: str
     config: Mapping[str, Any]
     metadata: Mapping[str, Any]
+    parameters: Mapping[str, Any] = field(default_factory=dict)
 
 
 def op(
@@ -128,17 +144,22 @@ class _RefHandle:
         *,
         config: Optional[Mapping[str, Any]] = None,
         metadata: Optional[Mapping[str, Any]] = None,
-        **config_kwargs: Any,
+        parameters: Optional[Mapping[str, Any]] = None,
+        **parameter_kwargs: Any,
     ) -> RefInvocation:
         cfg: Dict[str, Any] = {}
         if config:
             cfg.update(config)
-        if config_kwargs:
-            cfg.update(config_kwargs)
+        param_map: Dict[str, Any] = {}
+        if parameters:
+            param_map.update(parameters)
+        if parameter_kwargs:
+            param_map.update(parameter_kwargs)
         return RefInvocation(
             graph_name=self._graph_name,
             config=cfg,
             metadata=dict(metadata or {}),
+            parameters=param_map,
         )
 
 
@@ -150,6 +171,37 @@ class _RefResolver:
         if name not in self._owner.graph_names:
             raise AttributeError(f"Unknown graph reference '{name}'")
         return _RefHandle(self._owner, name)
+
+
+class _ParamNamespace:
+    def __init__(self, graph: GraphDecl, defaults: Dict[str, Any]):
+        self._graph = graph
+        self._defaults = defaults
+
+    def _ensure_declared(self, name: str) -> None:
+        if not any(param.name == name for param in self._graph.parameters):
+            raise DSLEvaluationError(
+                f"Unknown parameter '{name}' referenced in graph '{self._graph.name}'"
+            )
+
+    def get(self, name: str) -> ParameterRefValue:
+        self._ensure_declared(name)
+        return ParameterRefValue(name=name)
+
+    def with_default(self, name: str, value: Any) -> ParameterRefValue:
+        self._ensure_declared(name)
+        if name in self._defaults:
+            existing = self._defaults[name]
+            if existing != value:
+                raise DSLEvaluationError(
+                    f"Conflicting default for parameter '{name}' in graph '{self._graph.name}'"
+                )
+        else:
+            self._defaults[name] = value
+        return ParameterRefValue(name=name, default=value)
+
+    def __getattr__(self, name: str) -> ParameterRefValue:
+        return self.get(name)
 
 
 # ---------------------------------------------------------------------------
@@ -209,7 +261,9 @@ class _DSLParser:
                 break
             if indent > block_indent:
                 raise self._error("Inconsistent indentation")
-            if stripped.startswith("input "):
+            if stripped.startswith("parameter "):
+                self._parse_parameter(graph, stripped)
+            elif stripped.startswith("input "):
                 self._parse_input(graph, stripped)
             elif stripped.startswith("output "):
                 self._parse_output(graph, stripped)
@@ -308,8 +362,34 @@ class _DSLParser:
                     default_expr=default_expr,
                     line=self.index + 1,
                 )
-            )
+                )
         return bindings
+
+    def _parse_parameter(self, graph: GraphDecl, stripped: str) -> None:
+        payload = stripped[len("parameter "):].strip()
+        if not payload:
+            raise self._error("Parameter declaration requires names")
+        for piece in payload.split(","):
+            part = piece.strip()
+            if not part:
+                continue
+            if "=" in part:
+                name_part, default_part = part.split("=", 1)
+                name = name_part.strip()
+                default_expr = default_part.strip() or None
+            else:
+                name = part
+                default_expr = None
+            self._validate_identifier(name, "parameter")
+            if any(param.name == name for param in graph.parameters):
+                raise self._error(f"Duplicate parameter '{name}'")
+            graph.parameters.append(
+                ParameterDecl(
+                    name=name,
+                    default_expr=default_expr,
+                    line=self.index + 1,
+                )
+            )
 
     def _parse_metadata(self, meta_str: str, line: int) -> Mapping[str, Any]:
         meta: Dict[str, Any] = {}
@@ -358,6 +438,69 @@ class _DSLParser:
 
     def _error(self, message: str) -> DSLParseError:
         return DSLParseError(f"{message} (line {self.index + 1})")
+
+
+def _rewrite_parameter_placeholders(expression: str) -> str:
+    result: List[str] = []
+    length = len(expression)
+    i = 0
+    while i < length:
+        if expression.startswith("Param.", i):
+            start = i + len("Param.")
+            if start >= length or not (expression[start].isalpha() or expression[start] == "_"):
+                result.append("Param.")
+                i = start
+                continue
+            end = start
+            while end < length and (expression[end].isalnum() or expression[end] == "_"):
+                end += 1
+            name = expression[start:end]
+            idx = end
+            while idx < length and expression[idx].isspace():
+                idx += 1
+            if idx < length and expression[idx] == ":":
+                idx += 1
+                default_expr, next_index = _extract_default_expression(expression, idx)
+                result.append(f"Param.with_default('{name}', {default_expr})")
+                i = next_index
+                continue
+            result.append(f"Param.get('{name}')")
+            i = end
+        else:
+            result.append(expression[i])
+            i += 1
+    return "".join(result)
+
+
+def _extract_default_expression(expression: str, start: int) -> Tuple[str, int]:
+    depth_paren = depth_bracket = depth_brace = 0
+    i = start
+    length = len(expression)
+    while i < length:
+        ch = expression[i]
+        if ch == "(":
+            depth_paren += 1
+        elif ch == ")":
+            if depth_paren == 0 and depth_bracket == 0 and depth_brace == 0:
+                break
+            depth_paren = max(0, depth_paren - 1)
+        elif ch == "[":
+            depth_bracket += 1
+        elif ch == "]":
+            if depth_paren == 0 and depth_bracket == 0 and depth_brace == 0:
+                break
+            depth_bracket = max(0, depth_bracket - 1)
+        elif ch == "{":
+            depth_brace += 1
+        elif ch == "}":
+            if depth_paren == 0 and depth_bracket == 0 and depth_brace == 0:
+                break
+            depth_brace = max(0, depth_brace - 1)
+        elif ch == "," and depth_paren == 0 and depth_bracket == 0 and depth_brace == 0:
+            break
+        i += 1
+    segment = expression[start:i].strip()
+    return segment, i
 
 
 # ---------------------------------------------------------------------------
@@ -437,12 +580,23 @@ class DSLProgram:
         inputs_map: Dict[str, List[str]] = {alias: [] for alias in graph.inputs}
         outputs_map: Dict[str, str] = {}
 
+        parameter_defaults: Dict[str, Any] = {}
+        param_namespace = _ParamNamespace(graph, parameter_defaults)
+        for param in graph.parameters:
+            if param.default_expr is not None:
+                parameter_defaults[param.name] = self._evaluate_default(
+                    param.default_expr,
+                    globals_ctx,
+                    locals_ctx,
+                    param_namespace=param_namespace,
+                )
+
         for output in graph.outputs:
             outputs_map[output.alias] = output.source
 
         for node in graph.nodes:
             operator_value = self._evaluate_operator_expr(
-                node.operator_expr, globals_ctx, locals_ctx
+                node.operator_expr, globals_ctx, locals_ctx, param_namespace=param_namespace
             )
             operator_ref, node_config, node_metadata = self._normalise_operator(operator_value)
             config_copy = dict(node_config)
@@ -456,6 +610,7 @@ class DSLProgram:
                     config_copy,
                     globals_ctx,
                     locals_ctx,
+                    param_namespace=param_namespace,
                 )
 
             nodes[node.name] = NodeSpec(
@@ -471,10 +626,20 @@ class DSLProgram:
             for (src_node, src_port, dst_node, dst_port) in edges
         ]
         outputs_spec = {alias: source for alias, source in outputs_map.items()}
+        parameters_spec: Dict[str, ParameterSpec] = {}
+        for param in graph.parameters:
+            if param.name in parameter_defaults:
+                parameters_spec[param.name] = ParameterSpec(
+                    name=param.name,
+                    default=parameter_defaults[param.name],
+                )
+            else:
+                parameters_spec[param.name] = ParameterSpec(name=param.name)
 
         return GraphSpec(
             nodes=nodes,
             edges=edges_spec,
+             parameters=parameters_spec,
             inputs=compact_inputs,
             outputs=outputs_spec,
             metadata=dict(graph.metadata),
@@ -485,6 +650,8 @@ class DSLProgram:
         expr: str,
         globals_ctx: Mapping[str, Any],
         locals_ctx: Mapping[str, Any],
+        *,
+        param_namespace: Optional[_ParamNamespace] = None,
     ) -> Any:
         self._refresh_ops_namespace()
         eval_globals = dict(globals_ctx)
@@ -492,6 +659,9 @@ class DSLProgram:
         eval_locals["op"] = op
         eval_locals["ops"] = self._ops_namespace
         eval_locals["Ref"] = _RefResolver(self)
+        if param_namespace is None:
+            param_namespace = _ParamNamespace(GraphDecl(name="<anonymous>"), {})
+        eval_locals["Param"] = param_namespace
         prepared_expr = self._prepare_operator_expr(expr, eval_globals, eval_locals)
         try:
             return eval(prepared_expr, eval_globals, eval_locals)  # pylint: disable=eval-used
@@ -506,7 +676,12 @@ class DSLProgram:
             return value.operator, value.config, value.metadata
         if isinstance(value, RefInvocation):
             nested = self.build(value.graph_name)
-            return nested, value.config, value.metadata
+            config_map = dict(value.config)
+            if value.parameters:
+                parameters_cfg = dict(config_map.get("parameters", {}))
+                parameters_cfg.update(value.parameters)
+                config_map["parameters"] = parameters_cfg
+            return nested, config_map, value.metadata
         return value, {}, {}
 
     def _handle_binding(
@@ -519,6 +694,8 @@ class DSLProgram:
         node_config: Dict[str, Any],
         globals_ctx: Mapping[str, Any],
         locals_ctx: Mapping[str, Any],
+        *,
+        param_namespace: Optional[_ParamNamespace] = None,
     ) -> None:
         target_port = binding.port
         if binding.source:
@@ -533,7 +710,12 @@ class DSLProgram:
                     )
                 inputs_map[source].append(f"{node.name}.{target_port}")
         if binding.default_expr is not None:
-            default_value = self._evaluate_default(binding.default_expr, globals_ctx, locals_ctx)
+            default_value = self._evaluate_default(
+                binding.default_expr,
+                globals_ctx,
+                locals_ctx,
+                param_namespace=param_namespace,
+            )
             node_config.setdefault("call", {})[target_port] = default_value
 
     def _evaluate_default(
@@ -541,10 +723,14 @@ class DSLProgram:
         expr: str,
         globals_ctx: Mapping[str, Any],
         locals_ctx: Mapping[str, Any],
+        *,
+        param_namespace: Optional[_ParamNamespace] = None,
     ) -> Any:
         eval_globals = dict(globals_ctx)
         eval_locals = dict(locals_ctx)
         eval_locals.setdefault("ops", self._ops_namespace)
+        if param_namespace is not None:
+            eval_locals.setdefault("Param", param_namespace)
         try:
             return eval(expr, eval_globals, eval_locals)  # pylint: disable=eval-used
         except Exception as exc:
@@ -559,6 +745,9 @@ class DSLProgram:
         expression = expr.strip()
         if not expression:
             raise DSLEvaluationError("Empty operator expression")
+
+        expression = _rewrite_parameter_placeholders(expression)
+        expression = re.sub(r"(?<![=!<>])=\s*:", "=", expression)
 
         # Expand bare operator names into ops.<name>()
         if expression[0].isalpha() and "(" not in expression.split()[0]:

@@ -62,6 +62,26 @@ _NO_DEFAULT = object()
 
 
 @dataclass(frozen=True)
+class ParameterSpec:
+    """Graph level parameter descriptor."""
+
+    name: str
+    default: Any = _NO_DEFAULT
+
+    @property
+    def required(self) -> bool:
+        return self.default is _NO_DEFAULT
+
+
+@dataclass(frozen=True)
+class ParameterRefValue:
+    """Placeholder referencing a graph parameter."""
+
+    name: str
+    default: Any = _NO_DEFAULT
+
+
+@dataclass(frozen=True)
 class PortDefinition:
     """Description of a node input/output port."""
 
@@ -332,6 +352,7 @@ class GraphSpec:
 
     nodes: Mapping[str, NodeSpec]
     edges: Sequence[EdgeSpec]
+    parameters: Mapping[str, ParameterSpec] = field(default_factory=dict)
     inputs: Mapping[str, Union[str, Sequence[str]]] = field(default_factory=dict)
     outputs: Mapping[str, str] = field(default_factory=dict)
     metadata: Mapping[str, Any] = field(default_factory=dict)
@@ -340,9 +361,20 @@ class GraphSpec:
     def from_dict(cls, data: Mapping[str, Any]) -> "GraphSpec":
         nodes_raw = data.get("nodes", {})
         edges_raw = data.get("edges", [])
+        parameters_raw = data.get("parameters", {})
         inputs = dict(data.get("inputs", {}))
         outputs = dict(data.get("outputs", {}))
         metadata = dict(data.get("metadata", {}))
+
+        parameters: Dict[str, ParameterSpec] = {}
+        for name, spec in parameters_raw.items():
+            if isinstance(spec, ParameterSpec):
+                parameters[name] = spec
+            elif isinstance(spec, Mapping):
+                default = spec.get("default", _NO_DEFAULT)
+                parameters[name] = ParameterSpec(name=name, default=default)
+            else:
+                parameters[name] = ParameterSpec(name=name, default=spec)
 
         nodes: Dict[str, NodeSpec] = {}
         for node_id, spec in nodes_raw.items():
@@ -376,6 +408,7 @@ class GraphSpec:
         return cls(
             nodes=nodes,
             edges=edges,
+            parameters=parameters,
             inputs=inputs,
             outputs=outputs,
             metadata=metadata,
@@ -469,6 +502,7 @@ class GraphRuntime:
         graph_outputs: Mapping[str, NodeOutputRef],
         adjacency: Mapping[str, Set[str]],
         topo_order: Sequence[str],
+        parameters: Mapping[str, Any],
     ):
         self.spec = spec
         self.node_runtimes = dict(node_runtimes)
@@ -479,6 +513,7 @@ class GraphRuntime:
         self.graph_outputs = dict(graph_outputs)
         self._adjacency = {node: set(targets) for node, targets in adjacency.items()}
         self.topological_order = list(topo_order)
+        self.parameters = dict(parameters)
 
     def run(
         self,
@@ -532,6 +567,7 @@ class GraphRuntime:
     def describe(self) -> Dict[str, Any]:
         """Return a serialisable view of the runtime for inspection/UI."""
         return {
+            "parameters": dict(self.parameters),
             "nodes": {
                 node_id: {
                     "operator": runtime.template.name,
@@ -616,6 +652,77 @@ class _ExecutionState:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_parameter_values(
+    spec: GraphSpec,
+    overrides: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    resolved: Dict[str, Any] = {}
+    overrides_map = dict(overrides or {})
+    for name, value in overrides_map.items():
+        if name not in spec.parameters:
+            raise GraphBuildError(
+                f"Graph parameter '{name}' is not defined on spec "
+                f"'{spec.metadata.get('name', '') or '<anonymous>'}'"
+            )
+        resolved[name] = value
+
+    for name, param in spec.parameters.items():
+        if name not in resolved and not param.required:
+            resolved[name] = param.default
+
+    return resolved
+
+
+def _substitute_parameter_refs(
+    value: Any,
+    resolved: Dict[str, Any],
+    parameters: Mapping[str, ParameterSpec],
+    *,
+    node_id: str,
+) -> Any:
+    if isinstance(value, ParameterRefValue):
+        param_name = value.name
+        if param_name not in parameters:
+            raise GraphBuildError(
+                f"Node '{node_id}' references unknown parameter '{param_name}'"
+            )
+        if param_name not in resolved:
+            if value.default is not _NO_DEFAULT:
+                resolved[param_name] = value.default
+            else:
+                raise GraphBuildError(
+                    f"Parameter '{param_name}' required by node '{node_id}' "
+                    "is missing a value"
+                )
+        return resolved[param_name]
+
+    if isinstance(value, Mapping):
+        return {
+            key: _substitute_parameter_refs(val, resolved, parameters, node_id=node_id)
+            for key, val in value.items()
+        }
+
+    if isinstance(value, tuple):
+        return tuple(
+            _substitute_parameter_refs(item, resolved, parameters, node_id=node_id)
+            for item in value
+        )
+
+    if isinstance(value, list):
+        return [
+            _substitute_parameter_refs(item, resolved, parameters, node_id=node_id)
+            for item in value
+        ]
+
+    if isinstance(value, set):
+        return {
+            _substitute_parameter_refs(item, resolved, parameters, node_id=node_id)
+            for item in value
+        }
+
+    return value
+
+
 def _template_from_graph_spec(
     graph_spec: GraphSpec,
     registry: "OperatorRegistry",
@@ -635,8 +742,17 @@ def _template_from_graph_spec(
     template_metadata = dict(graph_spec.metadata)
 
     def factory(config: Mapping[str, Any], runtime_id: str) -> OperatorRunner:
+        cfg = dict(config)
+        parameter_overrides: Optional[Mapping[str, Any]] = None
+        if "parameters" in cfg:
+            parameter_overrides = _ensure_mapping(cfg.pop("parameters"), "parameters")
+        if cfg:
+            raise RegistrationError(
+                f"Unsupported config keys for graph operator '{template_name}': "
+                f"{', '.join(sorted(cfg))}"
+            )
         builder = GraphBuilder(registry)
-        runtime = builder.build(graph_spec)
+        runtime = builder.build(graph_spec, parameters=parameter_overrides)
         return GraphOperatorRunner(
             runtime=runtime,
             name=runtime_id or template_name,
@@ -658,9 +774,16 @@ class GraphBuilder:
     def __init__(self, registry: Optional["OperatorRegistry"] = None):
         self.registry = registry or registry_default
 
-    def build(self, spec: GraphSpec) -> GraphRuntime:
+    def build(
+        self,
+        spec: GraphSpec,
+        *,
+        parameters: Optional[Mapping[str, Any]] = None,
+    ) -> GraphRuntime:
         if not spec.nodes:
             raise GraphBuildError("GraphSpec must contain at least one node")
+
+        resolved_parameters = _resolve_parameter_values(spec, parameters)
 
         node_runtimes: Dict[str, NodeRuntime] = {}
         inbound: Dict[str, Dict[str, Union[GraphInputRef, NodeOutputRef]]] = defaultdict(dict)
@@ -692,7 +815,13 @@ class GraphBuilder:
                 raise RegistrationError(
                     f"Unsupported operator reference for node '{node_id}': {type(operator_ref)!r}"
                 )
-            runner = template.instantiate(config=node_spec.config, runtime_id=node_id)
+            node_config = _substitute_parameter_refs(
+                node_spec.config,
+                resolved_parameters,
+                spec.parameters,
+                node_id=node_id,
+            )
+            runner = template.instantiate(config=node_config, runtime_id=node_id)
             node_runtimes[node_id] = NodeRuntime(
                 node_id=node_id,
                 template=template,
@@ -799,6 +928,7 @@ class GraphBuilder:
             graph_outputs=graph_outputs,
             adjacency=adjacency,
             topo_order=topo_order,
+            parameters=resolved_parameters,
         )
 
 
@@ -893,7 +1023,16 @@ class OperatorRegistry:
 
         def factory(config: Mapping[str, Any], runtime_id: str) -> OperatorRunner:
             builder = GraphBuilder(self)
-            runtime = builder.build(graph_spec)
+            cfg = dict(config)
+            parameter_overrides: Optional[Mapping[str, Any]] = None
+            if "parameters" in cfg:
+                parameter_overrides = _ensure_mapping(cfg.pop("parameters"), "parameters")
+            if cfg:
+                raise RegistrationError(
+                    f"Unsupported config keys for graph operator '{name}': "
+                    f"{', '.join(sorted(cfg))}"
+                )
+            runtime = builder.build(graph_spec, parameters=parameter_overrides)
             return GraphOperatorRunner(
                 runtime=runtime,
                 name=runtime_id or name,
@@ -969,9 +1108,10 @@ def build_graph(
     spec: GraphSpec,
     *,
     registry: Optional[OperatorRegistry] = None,
+    parameters: Optional[Mapping[str, Any]] = None,
 ) -> GraphRuntime:
     builder = GraphBuilder(registry or registry_default)
-    return builder.build(spec)
+    return builder.build(spec, parameters=parameters)
 
 
 def returns_keys(**outputs: Any):
@@ -1182,6 +1322,8 @@ __all__ = [
     "GraphBuilder",
     "GraphRuntime",
     "GraphSpec",
+    "ParameterSpec",
+    "ParameterRefValue",
     "NodeSpec",
     "EdgeSpec",
     "OperatorRegistry",
