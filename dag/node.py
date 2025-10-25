@@ -738,8 +738,14 @@ class GraphBuilder:
 
         # Validate required ports
         for node_id, runtime in node_runtimes.items():
+            node_spec = spec.nodes[node_id]
+            call_overrides: Mapping[str, Any] = {}
+            if isinstance(node_spec.config, Mapping):
+                call_overrides = node_spec.config.get("call", {})
             for port_name, port_def in runtime.input_ports.items():
                 if port_name not in inbound[node_id] and port_def.required:
+                    if port_name in call_overrides:
+                        continue
                     raise GraphBuildError(
                         f"Required input '{port_name}' on node '{node_id}' "
                         "is not connected and has no default value"
