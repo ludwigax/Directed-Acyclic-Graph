@@ -79,7 +79,7 @@ class RefInvocation:
     graph_name: str
     config: Mapping[str, Any]
     metadata: Mapping[str, Any]
-    parameters: Mapping[str, Any] = field(default_factory=dict)
+    init_args: Mapping[str, Any] = field(default_factory=dict)
 
 
 def op(
@@ -144,22 +144,25 @@ class _RefHandle:
         *,
         config: Optional[Mapping[str, Any]] = None,
         metadata: Optional[Mapping[str, Any]] = None,
+        init: Optional[Mapping[str, Any]] = None,
         parameters: Optional[Mapping[str, Any]] = None,
-        **parameter_kwargs: Any,
+        **init_kwargs: Any,
     ) -> RefInvocation:
         cfg: Dict[str, Any] = {}
         if config:
             cfg.update(config)
-        param_map: Dict[str, Any] = {}
+        init_map: Dict[str, Any] = {}
+        if init:
+            init_map.update(init)
         if parameters:
-            param_map.update(parameters)
-        if parameter_kwargs:
-            param_map.update(parameter_kwargs)
+            init_map.update(parameters)
+        if init_kwargs:
+            init_map.update(init_kwargs)
         return RefInvocation(
             graph_name=self._graph_name,
             config=cfg,
             metadata=dict(metadata or {}),
-            parameters=param_map,
+            init_args=init_map,
         )
 
 
@@ -232,11 +235,18 @@ class _DSLParser:
     def _parse_graph(self) -> GraphDecl:
         line = self._current_line()
         stripped = line.strip()
-        if self._indent_of(line) != 0 or not stripped.startswith("graph "):
-            raise self._error("Expected 'graph <name>:'")
+        if self._indent_of(line) != 0:
+            raise self._error("Expected GRAPH declaration at indentation level 0")
+
+        if not stripped.startswith("GRAPH "):
+            if stripped.lower().startswith("graph "):
+                raise self._error("Use uppercase keyword 'GRAPH'")
+            raise self._error("Expected 'GRAPH <name>:'")
+
         if not stripped.endswith(":"):
             raise self._error("Graph declaration must end with ':'")
-        payload = stripped[6:-1].strip()
+
+        payload = stripped[len("GRAPH ") : -1].strip()
         if not payload:
             raise self._error("Graph declaration missing name")
         metadata: Mapping[str, Any] = {}
@@ -261,19 +271,25 @@ class _DSLParser:
                 break
             if indent > block_indent:
                 raise self._error("Inconsistent indentation")
-            if stripped.startswith("parameter "):
+            if stripped.startswith("PARAMETER "):
                 self._parse_parameter(graph, stripped)
-            elif stripped.startswith("input "):
+            elif stripped.startswith("INPUT "):
                 self._parse_input(graph, stripped)
-            elif stripped.startswith("output "):
+            elif stripped.startswith("OUTPUT "):
                 self._parse_output(graph, stripped)
+            elif stripped.lower().startswith("parameter "):
+                raise self._error("Use uppercase keyword 'PARAMETER'")
+            elif stripped.lower().startswith("input "):
+                raise self._error("Use uppercase keyword 'INPUT'")
+            elif stripped.lower().startswith("output "):
+                raise self._error("Use uppercase keyword 'OUTPUT'")
             else:
                 self._parse_node(graph, stripped)
             self.index += 1
         return graph
 
     def _parse_input(self, graph: GraphDecl, stripped: str) -> None:
-        payload = stripped[len("input "):].strip()
+        payload = stripped[len("INPUT "):].strip()
         if not payload:
             raise self._error("Input declaration requires names")
         for alias in payload.replace(",", " ").split():
@@ -283,7 +299,7 @@ class _DSLParser:
             graph.inputs.append(alias)
 
     def _parse_output(self, graph: GraphDecl, stripped: str) -> None:
-        payload = stripped[len("output "):].strip()
+        payload = stripped[len("OUTPUT "):].strip()
         if not payload:
             raise self._error("Output declaration requires a source")
         if "=" in payload:
@@ -366,7 +382,7 @@ class _DSLParser:
         return bindings
 
     def _parse_parameter(self, graph: GraphDecl, stripped: str) -> None:
-        payload = stripped[len("parameter "):].strip()
+        payload = stripped[len("PARAMETER "):].strip()
         if not payload:
             raise self._error("Parameter declaration requires names")
         for piece in payload.split(","):
@@ -677,10 +693,20 @@ class DSLProgram:
         if isinstance(value, RefInvocation):
             nested = self.build(value.graph_name)
             config_map = dict(value.config)
-            if value.parameters:
-                parameters_cfg = dict(config_map.get("parameters", {}))
-                parameters_cfg.update(value.parameters)
-                config_map["parameters"] = parameters_cfg
+            if value.init_args:
+                init_cfg = dict(config_map.get("init", {}))
+                init_cfg.update(value.init_args)
+                config_map["init"] = init_cfg
+            legacy_params = config_map.pop("parameters", None)
+            if legacy_params:
+                init_cfg = dict(config_map.get("init", {}))
+                if isinstance(legacy_params, Mapping):
+                    init_cfg.update(legacy_params)
+                else:
+                    raise DSLEvaluationError(
+                        f"Expected mapping for graph init overrides on '{value.graph_name}'"
+                    )
+                config_map["init"] = init_cfg
             return nested, config_map, value.metadata
         return value, {}, {}
 

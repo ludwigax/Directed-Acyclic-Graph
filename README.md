@@ -1,4 +1,4 @@
-# DAG â€“ Declarative Graph Runtime
+# DAG â€?Declarative Graph Runtime
 
 `dag` is a light-weight toolkit for describing, executing, and inspecting directed acyclic computation graphs in Python. It offers:
 
@@ -100,13 +100,11 @@ print(runtime.run(inputs={"value": 4})["result"])  # 20
 In the DSL the `parameter` keyword creates placeholders and `Param.<name>` injects them into operator configs (with optional defaults):
 
 ```text
-graph scaler:
-    parameter scale
-    input value
+GRAPH scaler:\r\n    PARAMETER scale=3\r\n    INPUT value
 
-    mul = ops.multiplication(call={"b": Param.scale : 3})[a=value]
+    mul = ops.multiplication()[a=value, b=: Param.scale]
 
-    output result = mul.result
+    OUTPUT result = mul.result
 ```
 
 Nested graphs receive overrides via `Ref.scaler(scale=7)` or `Ref.scaler(parameters={"scale": 7})`.
@@ -177,13 +175,13 @@ from dag.dsl import parse_dsl
 from dag.node import build_graph
 
 dsl_text = """
-graph scoring:
-    input x, y
+GRAPH scoring:
+    INPUT x, y
 
     add = ops.addition()[a=x, b=y]
     scale = ops.multiplication()[a=add.result, b=:0.5]
 
-    output score = scale.result
+    OUTPUT score = scale.result
 """
 
 program = parse_dsl(dsl_text, globals=globals(), locals=locals())
@@ -195,14 +193,12 @@ print(runtime.run(inputs={"x": 2, "y": 4}))
 You can attach parameters in DSL just as in Python:
 
 ```text
-graph tuned_scoring:
-    parameter weight
-    input x, y
+GRAPH tuned_scoring:\r\n    PARAMETER weight\r\n    INPUT x, y
 
     base = Ref.scoring()[x=x, y=y]
-    adjust = ops.multiplication(call={"b": Param.weight : 0.2})[a=y]
+    adjust = ops.multiplication()[a=y, b=: Param.weight]
 
-    output score = ops.addition()[a=base.score, b=adjust.result]
+    OUTPUT score = ops.addition()[a=base.score, b=adjust.result]
 ```
 
 The DSL shares the same registry as the Python API, so any decorated function/class is instantly available in `ops.*`. The generated `GraphSpec` can also be serialized, visualized, or embedded in other specs.
@@ -211,9 +207,10 @@ The DSL shares the same registry as the Python API, so any decorated function/cl
 
 ## Examples & Next Steps
 
-- `examples/declarative_math_example.py` â€“ fully programmatic specs.
-- `examples/dsl_equation_example.py` â€“ nested graphs via DSL.
-- `examples/inspect_*` â€“ console and web inspection utilities.
+- `examples/declarative_math_example.py` â€?fully programmatic specs.
+- `examples/dsl_equation_example.py` â€?nested graphs via DSL.
+- `examples/inspect_*` â€?console and web inspection utilities.
+- `examples/parameter_override_demo.py` â€?parameter overrides for registered graphs and DSL `Ref` usage.
 
 Ideas for extending your graph stack:
 
@@ -226,3 +223,6 @@ Ideas for extending your graph stack:
 ## License
 
 MIT Â© Ludwig.
+
+
+

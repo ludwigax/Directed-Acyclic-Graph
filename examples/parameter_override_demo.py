@@ -57,7 +57,7 @@ def main() -> None:
                 "default": {"operator": "scaler_template"},
                 "custom": {
                     "operator": "scaler_template",
-                    "config": {"parameters": {"scale": 5.0}},
+                    "config": {"init": {"scale": 5.0}},
                 },
             },
             "edges": [],
@@ -83,22 +83,22 @@ def main() -> None:
     # --------------------------------------------------------------- #
     user_scale = 7.0
     dsl_text = """
-graph scaler:
-    parameter scale
-    input value
+GRAPH scaler:
+    PARAMETER scale=2
+    INPUT value
 
-    node = ops.scale_mul(call={"scale": Param.scale : 2})[value=value]
+    node = ops.scale_mul()[value=value, scale=: Param.scale]
 
-    output result = node.result
+    OUTPUT result = node.result
 
-graph wrapper:
-    input value
+GRAPH wrapper:
+    INPUT value
 
     base = Ref.scaler()[value=value]
     tuned = Ref.scaler(scale=user_scale)[value=value]
 
-    output base = base.result
-    output tuned = tuned.result
+    OUTPUT base = base.result
+    OUTPUT tuned = tuned.result
 """
 
     program = parse_dsl(dsl_text, globals=globals(), locals=locals())
@@ -115,3 +115,9 @@ graph wrapper:
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+

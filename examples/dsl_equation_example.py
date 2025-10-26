@@ -8,6 +8,10 @@ syntax. Run with::
 """
 
 import math
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dag.dsl import parse_dsl
 from dag.node import build_graph, register_function, returns_keys
@@ -44,8 +48,8 @@ def multiply3(a: float, b: float, c: float) -> float:
 
 
 dsl_text = """
-graph inner_expression:
-    input x, y
+GRAPH inner_expression:
+    INPUT x, y
 
     fact = ops.factorial()[n=y]
     six = ops.constant(value=6)
@@ -55,19 +59,19 @@ graph inner_expression:
     div = ops.divide()[dividend=sum.result, divisor=three._return]
     sub = ops.subtract()[a=sum.result, b=div.result]
 
-    output result = sub.result
+    OUTPUT result = sub.result
 
-graph middle_expression:
-    input x, y
+GRAPH middle_expression:
+    INPUT x, y
 
     inner = Ref.inner_expression()[x=x, y=y]
     square = ops.power2()[a=x]
     sum = ops.addition()[a=inner.result, b=square.result]
 
-    output result = sum.result
+    OUTPUT result = sum.result
 
-graph outer_expression:
-    input x, y
+GRAPH outer_expression:
+    INPUT x, y
 
     middle = Ref.middle_expression()[x=x, y=y]
     inner = Ref.inner_expression()[x=x, y=y]
@@ -78,7 +82,7 @@ graph outer_expression:
     sub_y2 = ops.subtract()[a=y, b=const_two._return]
     outer_sum = ops.addition()[a=multiplier.result, b=sub_y2.result]
 
-    output result = outer_sum.result
+    OUTPUT result = outer_sum.result
 """
 
 

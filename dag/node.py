@@ -744,6 +744,8 @@ def _template_from_graph_spec(
     def factory(config: Mapping[str, Any], runtime_id: str) -> OperatorRunner:
         cfg = dict(config)
         parameter_overrides: Optional[Mapping[str, Any]] = None
+        if "init" in cfg:
+            parameter_overrides = _ensure_mapping(cfg.pop("init"), "init")
         if "parameters" in cfg:
             parameter_overrides = _ensure_mapping(cfg.pop("parameters"), "parameters")
         if cfg:
@@ -1025,6 +1027,8 @@ class OperatorRegistry:
             builder = GraphBuilder(self)
             cfg = dict(config)
             parameter_overrides: Optional[Mapping[str, Any]] = None
+            if "init" in cfg:
+                parameter_overrides = _ensure_mapping(cfg.pop("init"), "init")
             if "parameters" in cfg:
                 parameter_overrides = _ensure_mapping(cfg.pop("parameters"), "parameters")
             if cfg:
