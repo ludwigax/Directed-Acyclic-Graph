@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import inspect
 import re
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple
 
@@ -145,7 +146,6 @@ class _RefHandle:
         config: Optional[Mapping[str, Any]] = None,
         metadata: Optional[Mapping[str, Any]] = None,
         init: Optional[Mapping[str, Any]] = None,
-        parameters: Optional[Mapping[str, Any]] = None,
         **init_kwargs: Any,
     ) -> RefInvocation:
         cfg: Dict[str, Any] = {}
@@ -154,8 +154,6 @@ class _RefHandle:
         init_map: Dict[str, Any] = {}
         if init:
             init_map.update(init)
-        if parameters:
-            init_map.update(parameters)
         if init_kwargs:
             init_map.update(init_kwargs)
         return RefInvocation(
@@ -272,11 +270,14 @@ class _DSLParser:
             if indent > block_indent:
                 raise self._error("Inconsistent indentation")
             if stripped.startswith("PARAMETER "):
-                self._parse_parameter(graph, stripped)
+                statement = self._collect_statement_with_continuations(block_indent)
+                self._parse_parameter(graph, statement)
             elif stripped.startswith("INPUT "):
-                self._parse_input(graph, stripped)
+                statement = self._collect_statement_with_continuations(block_indent)
+                self._parse_input(graph, statement)
             elif stripped.startswith("OUTPUT "):
-                self._parse_output(graph, stripped)
+                statement = self._collect_statement_with_continuations(block_indent)
+                self._parse_output(graph, statement)
             elif stripped.lower().startswith("parameter "):
                 raise self._error("Use uppercase keyword 'PARAMETER'")
             elif stripped.lower().startswith("input "):
@@ -287,6 +288,28 @@ class _DSLParser:
                 self._parse_node(graph, stripped)
             self.index += 1
         return graph
+
+    def _collect_statement_with_continuations(self, block_indent: int) -> str:
+        """Collect the current line plus any indented continuations.
+
+        Continuation lines must be more indented than the block indent and are
+        concatenated with spaces so downstream parsing can treat the statement as
+        a single logical line.
+        """
+        parts: List[str] = [self._current_line().strip()]
+        lookahead = self.index + 1
+        while lookahead < self.length:
+            candidate = self.lines[lookahead]
+            stripped = candidate.strip()
+            if not stripped:
+                break
+            indent = self._indent_of(candidate)
+            if indent <= block_indent:
+                break
+            parts.append(stripped)
+            lookahead += 1
+        self.index = lookahead - 1
+        return " ".join(parts)
 
     def _parse_input(self, graph: GraphDecl, stripped: str) -> None:
         payload = stripped[len("INPUT "):].strip()
@@ -697,16 +720,6 @@ class DSLProgram:
                 init_cfg = dict(config_map.get("init", {}))
                 init_cfg.update(value.init_args)
                 config_map["init"] = init_cfg
-            legacy_params = config_map.pop("parameters", None)
-            if legacy_params:
-                init_cfg = dict(config_map.get("init", {}))
-                if isinstance(legacy_params, Mapping):
-                    init_cfg.update(legacy_params)
-                else:
-                    raise DSLEvaluationError(
-                        f"Expected mapping for graph init overrides on '{value.graph_name}'"
-                    )
-                config_map["init"] = init_cfg
             return nested, config_map, value.metadata
         return value, {}, {}
 
@@ -775,23 +788,29 @@ class DSLProgram:
         expression = _rewrite_parameter_placeholders(expression)
         expression = re.sub(r"(?<![=!<>])=\s*:", "=", expression)
 
-        # Expand bare operator names into ops.<name>()
-        if expression[0].isalpha() and "(" not in expression.split()[0]:
-            # Extract leading identifier
-            match = re.match(r"([A-Za-z_][A-Za-z0-9_]*)", expression)
-            if match:
-                name = match.group(1)
-                if not self._ops_namespace.has(name):
-                    raise DSLEvaluationError(
-                        f"Unknown operator '{name}'. Use 'ops.{name}' or register it first."
-                    )
-                rest = expression[len(name):].lstrip()
-                expression = f"ops.{name}{rest or '()'}"
-
         # Normalise empty parentheses/brackets
         expression = expression.replace("(*)", "()")
         expression = re.sub(r"\(\s*\)", "()", expression)
         expression = re.sub(r"\[\s*\]", "", expression)
+
+        head_token = expression.split()[0]
+        if head_token.startswith("Ref."):
+            if "(" not in head_token:
+                expression = f"{head_token}(){expression[len(head_token):]}"
+        else:
+            match = re.match(r"([A-Za-z_][A-Za-z0-9_]*)", head_token)
+            if not match:
+                raise DSLEvaluationError(f"Malformed operator expression '{expr}'")
+            name = match.group(1)
+            if not self._ops_namespace.has(name):
+                raise DSLEvaluationError(
+                    f"Unknown operator '{name}'. Use 'ops.{name}' or register it first."
+                )
+            rest = expression[len(name):]
+            expression = f"ops.{name}{rest or '()'}"
+            head_token = expression.split()[0]
+            if "(" not in head_token:
+                expression = f"{head_token}(){expression[len(head_token):]}"
 
         return expression
 
@@ -824,6 +843,17 @@ def parse_dsl(
     globals: Optional[Mapping[str, Any]] = None,
     locals: Optional[Mapping[str, Any]] = None,
 ) -> DSLProgram:
+    if globals is None or locals is None:
+        frame = inspect.currentframe()
+        try:
+            caller = frame.f_back if frame is not None else None
+            if caller is not None:
+                if globals is None:
+                    globals = caller.f_globals
+                if locals is None:
+                    locals = caller.f_locals
+        finally:
+            del frame
     parser = _DSLParser(text)
     graphs = parser.parse()
     return DSLProgram(

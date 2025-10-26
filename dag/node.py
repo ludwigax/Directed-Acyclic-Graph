@@ -81,6 +81,63 @@ class ParameterRefValue:
     default: Any = _NO_DEFAULT
 
 
+_SER_PARAM_KEY = "__dag_param__"
+_SER_TYPE_KEY = "__dag_type__"
+_SER_ITEMS_KEY = "items"
+_SER_TYPE_TUPLE = "tuple"
+_SER_TYPE_SET = "set"
+
+
+def _encode_config_value(value: Any) -> Any:
+    if isinstance(value, ParameterRefValue):
+        payload: Dict[str, Any] = {_SER_PARAM_KEY: value.name}
+        if value.default is not _NO_DEFAULT:
+            payload["default"] = value.default
+        return payload
+
+    if isinstance(value, Mapping):
+        return {key: _encode_config_value(val) for key, val in value.items()}
+
+    if isinstance(value, tuple):
+        return {
+            _SER_TYPE_KEY: _SER_TYPE_TUPLE,
+            _SER_ITEMS_KEY: [_encode_config_value(item) for item in value],
+        }
+
+    if isinstance(value, set):
+        return {
+            _SER_TYPE_KEY: _SER_TYPE_SET,
+            _SER_ITEMS_KEY: [_encode_config_value(item) for item in value],
+        }
+
+    if isinstance(value, list):
+        return [_encode_config_value(item) for item in value]
+
+    return value
+
+
+def _decode_config_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        if set(value.keys()) <= {_SER_PARAM_KEY, "default"} and _SER_PARAM_KEY in value:
+            default = value.get("default", _NO_DEFAULT)
+            return ParameterRefValue(name=value[_SER_PARAM_KEY], default=default)
+
+        type_tag = value.get(_SER_TYPE_KEY)
+        if type_tag == _SER_TYPE_TUPLE:
+            items = value.get(_SER_ITEMS_KEY, [])
+            return tuple(_decode_config_value(item) for item in items)
+        if type_tag == _SER_TYPE_SET:
+            items = value.get(_SER_ITEMS_KEY, [])
+            return {_decode_config_value(item) for item in items}
+
+        return {key: _decode_config_value(val) for key, val in value.items()}
+
+    if isinstance(value, list):
+        return [_decode_config_value(item) for item in value]
+
+    return value
+
+
 @dataclass(frozen=True)
 class PortDefinition:
     """Description of a node input/output port."""
@@ -391,7 +448,7 @@ class GraphSpec:
                 nodes[node_id] = NodeSpec(
                     id=node_id,
                     operator=operator_value,
-                    config=dict(spec.get("config", {})),
+                    config=_decode_config_value(spec.get("config", {})),
                     metadata=dict(spec.get("metadata", {})),
                 )
 
@@ -413,6 +470,52 @@ class GraphSpec:
             outputs=outputs,
             metadata=metadata,
         )
+
+    def to_dict(self) -> Dict[str, Any]:
+        nodes: Dict[str, Any] = {}
+        for node_id, node_spec in self.nodes.items():
+            operator_ref = node_spec.operator
+            if isinstance(operator_ref, GraphSpec):
+                operator_value: Any = operator_ref.to_dict()
+            elif isinstance(operator_ref, OperatorTemplate):
+                operator_value = operator_ref.name
+            else:
+                operator_value = operator_ref
+            nodes[node_id] = {
+                "operator": operator_value,
+                "config": _encode_config_value(dict(node_spec.config)),
+                "metadata": dict(node_spec.metadata),
+            }
+
+        edges = [{"src": edge.src, "dst": edge.dst} for edge in self.edges]
+
+        parameters: Dict[str, Any] = {}
+        for name, spec in self.parameters.items():
+            if isinstance(spec, ParameterSpec):
+                if spec.default is _NO_DEFAULT:
+                    parameters[name] = {}
+                else:
+                    parameters[name] = {"default": spec.default}
+            elif isinstance(spec, Mapping):
+                parameters[name] = dict(spec)
+            else:
+                parameters[name] = {"default": spec}
+
+        inputs: Dict[str, Any] = {}
+        for alias, endpoint_spec in self.inputs.items():
+            if isinstance(endpoint_spec, (list, tuple, set)):
+                inputs[alias] = list(endpoint_spec)
+            else:
+                inputs[alias] = endpoint_spec
+
+        return {
+            "nodes": nodes,
+            "edges": edges,
+            "parameters": parameters,
+            "inputs": inputs,
+            "outputs": dict(self.outputs),
+            "metadata": dict(self.metadata),
+        }
 
 
 @dataclass(frozen=True)

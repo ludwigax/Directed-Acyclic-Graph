@@ -97,7 +97,36 @@ runtime = build_graph(scaler_spec, parameters={"scale": 5})
 print(runtime.run(inputs={"value": 4})["result"])  # 20
 ```
 
-In the DSL the `parameter` keyword creates placeholders and `Param.<name>` injects them into operator configs (with optional defaults):
+A trimmed excerpt from the `rall.agent` RAG workflow shows how the DSL scales to production-sized graphs while keeping configuration readable:
+
+```text
+GRAPH RAG_PIPELINE:
+    PARAMETER knowledge_chunk, knowledge_segment, metadata_manager,
+              vec_index, bm_index, ner_index,
+              clean_model="gpt-4o-mini", rewrite_model="gpt-4o-mini",
+              keywords_model="gpt-4o", route_model="o4-mini",
+              filter_model="gpt-5-mini", filter_max_results=12,
+              generator_model="o3", generator_url_template="https://www.example.com/{index}",
+              ner_threshold=0.5, topk_k=24,
+              hybrid_weights=(0.5, 0.5, 0.0), hybrid_sigmoid=(2.0, 0.25, 2.0)
+    INPUT question
+
+    clean_prompt = ops.agent.prompt.preprocess()[question=question]
+    clean_llm = ops.agent.llm.chat(model=Param.clean_model)[messages=clean_prompt.messages]
+    rewrite_prompt = ops.agent.prompt.rewrite()[current_question=clean_llm.response]
+    rewrite_llm = ops.agent.llm.chat(model=Param.rewrite_model)[messages=rewrite_prompt.messages]
+    keywords_prompt = ops.agent.prompt.keywords()[query=rewrite_llm.response]
+    keywords_llm = ops.agent.llm.chat(model=Param.keywords_model)[messages=keywords_prompt.messages]
+    vec_node = ops.agent.retrieve.vector(indices=Param.vec_index, chunks=Param.knowledge_chunk)[query=rewrite_llm.response]
+    hybrid = ops.agent.arrange.hybrid(weights=Param.hybrid_weights, sigmoid_k=Param.hybrid_sigmoid)[vec=vec_node.output, bm=..., ner=...]
+    OUTPUT answer = ops.agent.llm.chat(model=Param.generator_model)[messages=...].response
+```
+
+Every statement becomes a graph node, so the snippet doubles as living documentation of the inference pipeline.
+
+DSL keywords `init` and `call` are reserved—use parentheses for constructor arguments and bracket defaults with ':' for call-time values.
+
+In the DSL the `PARAMETER` keyword creates placeholders and `Param.<name>` injects them into operator configs (with optional defaults):
 
 ```text
 GRAPH scaler:\r\n    PARAMETER scale=3\r\n    INPUT value
@@ -107,7 +136,7 @@ GRAPH scaler:\r\n    PARAMETER scale=3\r\n    INPUT value
     OUTPUT result = mul.result
 ```
 
-Nested graphs receive overrides via `Ref.scaler(scale=7)` or `Ref.scaler(parameters={"scale": 7})`.
+Nested graphs receive overrides via `Ref.scaler(scale=7)`.
 
 ---
 
@@ -196,7 +225,7 @@ You can attach parameters in DSL just as in Python:
 GRAPH tuned_scoring:\r\n    PARAMETER weight\r\n    INPUT x, y
 
     base = Ref.scoring()[x=x, y=y]
-    adjust = ops.multiplication()[a=y, b=: Param.weight]
+    adjust = ops.multiplication()[a=y, b=Param.weight]
 
     OUTPUT score = ops.addition()[a=base.score, b=adjust.result]
 ```
@@ -205,7 +234,7 @@ The DSL shares the same registry as the Python API, so any decorated function/cl
 
 ---
 
-## Examples & Next Steps
+## Examples
 
 - `examples/declarative_math_example.py` â€?fully programmatic specs.
 - `examples/dsl_equation_example.py` â€?nested graphs via DSL.
