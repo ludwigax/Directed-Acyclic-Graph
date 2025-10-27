@@ -57,7 +57,7 @@ GRAPH SCALE_CORE(version="1.0"):
     INPUT value
     OUTPUT scaled = node.output
 
-    node = ScaleAndBias(scale=Param.scale, bias=0.0)[value=value]
+    node = ops.ScaleAndBias(scale=Param.scale, bias=0.0)[value=value]
 
 GRAPH PIPELINE:
     PARAMETER bias = 0.5

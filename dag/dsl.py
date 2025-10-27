@@ -793,24 +793,33 @@ class DSLProgram:
         expression = re.sub(r"\(\s*\)", "()", expression)
         expression = re.sub(r"\[\s*\]", "", expression)
 
-        head_token = expression.split()[0]
-        if head_token.startswith("Ref."):
-            if "(" not in head_token:
-                expression = f"{head_token}(){expression[len(head_token):]}"
+        token_match = re.match(r"([A-Za-z_][A-Za-z0-9_\.]*)", expression)
+        if not token_match:
+            raise DSLEvaluationError(f"Malformed operator expression '{expr}'")
+        token = token_match.group(1)
+        rest = expression[len(token):]
+
+        def _ensure_call_prefix(prefix: str, remainder: str) -> str:
+            if re.match(r"\s*\(", remainder):
+                return f"{prefix}{remainder}"
+            return f"{prefix}(){remainder}"
+
+        if token.startswith("Ref."):
+            expression = _ensure_call_prefix(token, rest)
+        elif token.startswith("ops."):
+            op_name = token[len("ops.") :]
+            if not op_name or not self._ops_namespace.has(op_name):
+                raise DSLEvaluationError(
+                    f"Unknown operator '{op_name or '<missing>'}'. Use 'ops.<name>' or register it first."
+                )
+            expression = _ensure_call_prefix(token, rest)
         else:
-            match = re.match(r"([A-Za-z_][A-Za-z0-9_]*)", head_token)
-            if not match:
-                raise DSLEvaluationError(f"Malformed operator expression '{expr}'")
-            name = match.group(1)
+            name = token
             if not self._ops_namespace.has(name):
                 raise DSLEvaluationError(
                     f"Unknown operator '{name}'. Use 'ops.{name}' or register it first."
                 )
-            rest = expression[len(name):]
-            expression = f"ops.{name}{rest or '()'}"
-            head_token = expression.split()[0]
-            if "(" not in head_token:
-                expression = f"{head_token}(){expression[len(head_token):]}"
+            expression = _ensure_call_prefix(f"ops.{name}", rest)
 
         return expression
 
@@ -871,6 +880,3 @@ __all__ = [
     "parse_dsl",
     "op",
 ]
-
-
-
