@@ -7,14 +7,9 @@ import inspect
 import re
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple
 
-from .node import (
-    EdgeSpec,
-    GraphSpec,
-    NodeSpec,
-    ParameterRefValue,
-    ParameterSpec,
-    registry_default,
-)
+from .core.ports import ParameterRefValue, ParameterSpec
+from .core.registry import registry_default
+from .core.specs import EdgeSpec, GraphSpec, NodeSpec
 
 
 # ---------------------------------------------------------------------------
@@ -693,14 +688,12 @@ class DSLProgram:
         param_namespace: Optional[_ParamNamespace] = None,
     ) -> Any:
         self._refresh_ops_namespace()
-        eval_globals = dict(globals_ctx)
-        eval_locals = dict(locals_ctx)
-        eval_locals["op"] = op
-        eval_locals["ops"] = self._ops_namespace
-        eval_locals["Ref"] = _RefResolver(self)
-        if param_namespace is None:
-            param_namespace = _ParamNamespace(GraphDecl(name="<anonymous>"), {})
-        eval_locals["Param"] = param_namespace
+        eval_globals, eval_locals, _ = self._build_eval_environment(
+            globals_ctx,
+            locals_ctx,
+            param_namespace=param_namespace,
+            include_operator_helpers=True,
+        )
         prepared_expr = self._prepare_operator_expr(expr, eval_globals, eval_locals)
         try:
             return eval(prepared_expr, eval_globals, eval_locals)  # pylint: disable=eval-used
@@ -765,11 +758,12 @@ class DSLProgram:
         *,
         param_namespace: Optional[_ParamNamespace] = None,
     ) -> Any:
-        eval_globals = dict(globals_ctx)
-        eval_locals = dict(locals_ctx)
-        eval_locals.setdefault("ops", self._ops_namespace)
-        if param_namespace is not None:
-            eval_locals.setdefault("Param", param_namespace)
+        eval_globals, eval_locals, _ = self._build_eval_environment(
+            globals_ctx,
+            locals_ctx,
+            param_namespace=param_namespace,
+            include_operator_helpers=False,
+        )
         try:
             return eval(expr, eval_globals, eval_locals)  # pylint: disable=eval-used
         except Exception as exc:
@@ -839,6 +833,25 @@ class DSLProgram:
             else:
                 result[alias] = endpoints
         return result
+
+    def _build_eval_environment(
+        self,
+        globals_ctx: Mapping[str, Any],
+        locals_ctx: Mapping[str, Any],
+        *,
+        param_namespace: Optional[_ParamNamespace] = None,
+        include_operator_helpers: bool,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any], _ParamNamespace]:
+        eval_globals = dict(globals_ctx)
+        eval_locals = dict(locals_ctx)
+        eval_locals["ops"] = self._ops_namespace
+        if include_operator_helpers:
+            eval_locals["op"] = op
+            eval_locals["Ref"] = _RefResolver(self)
+        if param_namespace is None:
+            param_namespace = _ParamNamespace(GraphDecl(name="<anonymous>"), {})
+        eval_locals.setdefault("Param", param_namespace)
+        return eval_globals, eval_locals, param_namespace
 
 
 # ---------------------------------------------------------------------------

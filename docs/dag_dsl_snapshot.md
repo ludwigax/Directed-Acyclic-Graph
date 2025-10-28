@@ -65,7 +65,7 @@ Once parsed via `parse_dsl(text)`, you may call `.build("PIPELINE")` to obtain a
 
 ## 3. Building and Inspecting Runtimes
 
-`GraphSpec` records the declarative structure, while `GraphBuilder` produces an executable `GraphRuntime`.
+`GraphSpec` records the declarative structure, while `GraphBuilder` produces an executable `ExecutionPlan`.
 
 ```python
 from dag.dsl import parse_dsl
@@ -88,7 +88,7 @@ runtime.clear_cache()       # reset memoised node outputs if needed
 ```
 
 - `build_graph` resolves graph parameters, instantiates each node (including nested graphs), wires dependencies, and returns a runtime ready for repeated execution.
-- `GraphRuntime.run()` accepts input mappings, optional `outputs`, `force_nodes`, or `use_cache` flags to control evaluation.
+- `ExecutionPlan.run()` accepts input mappings, optional `outputs`, `force_nodes`, or `use_cache` flags to control evaluation.
 - `describe()` is useful for debugging or feeding visualisation utilities; it mirrors the logical structure without exposing internal runner state.
 
 ## 4. Understanding `GraphSpec` and Serialisation

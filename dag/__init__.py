@@ -1,14 +1,43 @@
 """Convenience exports for the DAG package."""
 
 from .dsl import DSLEvaluationError, DSLParseError, DSLProgram, op, parse_dsl
-from .node import register_class, register_function, register_graph, returns_keys
+from .node import (
+    BuildError,
+    EdgeSpec,
+    ExecutionError,
+    ExecutionPlan,
+    GraphBuilder,
+    GraphRuntime,
+    GraphSpec,
+    NodeSpec,
+    ParameterRefValue,
+    ParameterSpec,
+    build_graph,
+    compile_template,
+    register_class,
+    register_function,
+    register_graph,
+    returns_keys,
+)
 
 __all__ = [
     "DSLProgram",
     "DSLParseError",
     "DSLEvaluationError",
+    "ExecutionError",
+    "ExecutionPlan",
+    "GraphRuntime",
+    "GraphBuilder",
+    "GraphSpec",
+    "NodeSpec",
+    "EdgeSpec",
+    "ParameterSpec",
+    "ParameterRefValue",
+    "BuildError",
     "op",
     "parse_dsl",
+    "build_graph",
+    "compile_template",
     "register_function",
     "register_class",
     "register_graph",

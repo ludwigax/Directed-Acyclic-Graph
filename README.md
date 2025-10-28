@@ -16,7 +16,7 @@ Use it for research pipelines, feature transforms, retrieval chains, or any work
 pip install dag
 ```
 
-Optional extras: `pip install fastapi uvicorn plotly networkx graphviz` to enable the web visualiser.
+Optional extras: `pip install fastapi uvicorn plotly networkx graphviz` (web visualiser currently being rebuilt after the runtime refactor).
 
 ---
 
@@ -120,7 +120,7 @@ The encoding preserves `ParameterRefValue` placeholders (`{"__dag_param__": "bia
 
 - `docs/dag_dsl_snapshot.md` - deep dive into the architecture with layered examples.
 - `examples/getting_started.py` - mirrors the four-step workflow from this README.
-- `dag.inspect_utils` - text summaries and a FastAPI/Plotly visualiser (`visualize_runtime`).
+- `dag.inspect_utils` - text summaries; FastAPI/Plotly visualiser coming back in a future release.
 
 ---
 
