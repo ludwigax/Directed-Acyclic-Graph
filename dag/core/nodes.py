@@ -5,7 +5,8 @@ Node templates, shells, and runtime wrappers.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Mapping, MutableMapping, Optional, Sequence
+import threading
+from typing import Any, Callable, Dict, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 from ..dbg import Debug, get_debug_state
 from .inspect import (
@@ -252,7 +253,7 @@ class GraphTemplate:
     outputs: Mapping[str, tuple[str, str]]
     parameters: Mapping[str, "ParameterSpec"]
     metadata: Mapping[str, Any] = field(default_factory=dict)
-    shell_index: Mapping[str, Sequence[str]] = field(default_factory=dict)
+    shell_index: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 class NodeRuntime:
@@ -277,6 +278,7 @@ class NodeRuntime:
         self._cache_valid = False
         self._cache_inputs: Optional[Dict[str, Any]] = None
         self._cache_outputs: Optional[Dict[str, Any]] = None
+        self._cache_lock = threading.Lock()
 
     def run(
         self,
@@ -286,26 +288,52 @@ class NodeRuntime:
         force: bool = False,
     ) -> Dict[str, Any]:
         inputs_dict = dict(inputs)
+
         if self.cache_enabled and use_cache and not force:
-            if self._cache_valid and self._cache_inputs == inputs_dict:
-                return dict(self._cache_outputs or {})
+            with self._cache_lock:
+                if self._cache_valid and self._cache_inputs == inputs_dict:
+                    return dict(self._cache_outputs or {})
 
         outputs = self.runner(**inputs_dict)
         outputs_dict = dict(outputs)
 
         if self.cache_enabled:
-            self._cache_valid = True
-            self._cache_inputs = inputs_dict
-            self._cache_outputs = outputs_dict
+            with self._cache_lock:
+                self._cache_valid = True
+                self._cache_inputs = inputs_dict
+                self._cache_outputs = outputs_dict
         else:
             self.clear_cache()
 
         return dict(outputs_dict)
 
     def clear_cache(self) -> None:
-        self._cache_valid = False
-        self._cache_inputs = None
-        self._cache_outputs = None
+        with self._cache_lock:
+            self._cache_valid = False
+            self._cache_inputs = None
+            self._cache_outputs = None
+
+    def get_cached(self) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+        with self._cache_lock:
+            if not self._cache_valid:
+                return None
+            inputs = dict(self._cache_inputs or {})
+            outputs = dict(self._cache_outputs or {})
+            return inputs, outputs
+
+    def update_cache(self, inputs: Mapping[str, Any], outputs: Mapping[str, Any]) -> None:
+        with self._cache_lock:
+            if self.cache_enabled:
+                self._cache_valid = True
+                self._cache_inputs = dict(inputs)
+                self._cache_outputs = dict(outputs)
+            else:
+                self._cache_valid = False
+                self._cache_inputs = None
+                self._cache_outputs = None
+
+    def set_cache(self, inputs: Mapping[str, Any], outputs: Mapping[str, Any]) -> None:
+        self.update_cache(inputs, outputs)
 
 
 def normalise_output(

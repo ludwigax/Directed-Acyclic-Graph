@@ -52,7 +52,7 @@ def compile_graph(
         outputs=outputs,
         parameters=spec.parameters,
         metadata=dict(spec.metadata),
-        shell_index={key: tuple(value) for key, value in shell_index.items()},
+        shell_index={key: tuple(sorted(dict.fromkeys(value))) for key, value in shell_index.items()},
     )
 
 
@@ -209,7 +209,7 @@ def _expand_graph(
                 metadata=metadata,
             )
             nodes[flat_id] = shell
-            shell_index[path_key] = [flat_id]
+            shell_index.setdefault(path_key, []).append(flat_id)
             interface_map[path_key] = NodeInterface(
                 inputs={port: [(flat_id, port)] for port in entry_template.input_ports},
                 outputs={port: (flat_id, port) for port in entry_template.output_ports},
@@ -244,9 +244,9 @@ def _expand_graph(
         edges.extend(sub_edges)
 
         flat_prefix = "__".join(path)
-        shell_index[path_key] = [
+        shell_index.setdefault(path_key, []).extend(
             node_name for node_name in sub_nodes if node_name.startswith(flat_prefix)
-        ]
+        )
 
         inputs_map: Dict[str, List[Tuple[str, str]]] = {}
         for alias, endpoint_spec in nested_spec.inputs.items():
