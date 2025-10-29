@@ -5,6 +5,7 @@
 - A runtime that instantiates registered operators, manages caching, and exposes debug stats.
 - Immutable `GraphSpec` definitions that can be generated from Python or the DSL and serialised back to plain data.
 - A readable DSL for sketching graphs, wiring parameters, and composing reusable templates.
+- Introspection tooling that keeps the original hierarchy intact so specs can be inspected without flattening.
 
 Use it for research pipelines, feature transforms, retrieval chains, or any workload that benefits from explicit, inspectable DAGs.
 
@@ -92,12 +93,16 @@ from dag.node import build_graph
 
 runtime = build_graph(pipeline_spec, parameters={"bias": 2.0})
 print(runtime.run({"x": 2.0, "y": 1.5}))  # {'total': 12.5}
+
+# run selected outputs, disable cache, force individual nodes, or cap concurrency
+runtime.run({"x": 1.0, "y": 1.0}, outputs=["total"], use_cache=False, max_workers=2)
 ```
 
-Runtime features:
+Runtime highlights:
 
 - `run(outputs=[...], force_nodes={...}, use_cache=False)` for selective execution.
-- `describe()` returns a serialisable snapshot (nodes, edges, parameters) for logging or UI tools.
+- Parallel scheduling via `max_workers` with per-node caches guarded by thread-safe runners.
+- Pre/post hooks (`ExecutionPlan.register_hook`) execute inside worker threads, enabling custom cache tweaks or result normalisation.
 - Debug hooks (`dag.dbg.DebuggingContext`) collect per-node timing/metrics without modifying operators.
 
 ---
@@ -119,8 +124,31 @@ The encoding preserves `ParameterRefValue` placeholders (`{"__dag_param__": "bia
 ## 5. Tooling & Examples
 
 - `docs/dag_dsl_snapshot.md` - deep dive into the architecture with layered examples.
-- `examples/getting_started.py` - mirrors the four-step workflow from this README.
-- `dag.inspect_utils` - text summaries; FastAPI/Plotly visualiser coming back in a future release.
+- `examples/getting_started.py` - mirrors the workflow, demonstrates parallel execution, hooks, and renders spec trees.
+- `dag.inspect_utils` - text/tree summaries (see below); FastAPI/Plotly visualiser coming back in a future release.
+
+### Inspect specs without flattening
+
+The text inspector preserves the hierarchy and annotates each node with its runtime state when a plan is available:
+
+```python
+from dag.inspect_utils import render_spec_tree, render_spec_node
+
+print(render_spec_tree(pipeline_spec, plan=runtime, root_name="PIPELINE"))
+print(render_spec_node(pipeline_spec, "scaled.node", plan=runtime, root_name="PIPELINE"))
+```
+
+Example output:
+
+```
+PIPELINE (graph) [computed]
+├── PIPELINE.helper [computed] <helper> :: add_pair
+├── PIPELINE.out [computed] <out> :: add_pair
+└── PIPELINE.scaled (graph) [computed]
+    └── PIPELINE.scaled.node [computed] <scaled__node> :: ScaleAndBias
+```
+
+States are inferred from the plan's cache: `computed` (cache populated), `pending` (never evaluated), `partial` (cache disabled/cleared), `unknown` (mixed children). Use `render_spec_node(...)` to drill into configs, metadata, execution stats, and cache status for any path or runtime id.
 
 ---
 

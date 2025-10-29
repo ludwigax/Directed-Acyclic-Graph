@@ -25,6 +25,18 @@ class BuildError(RuntimeError):
     """Raised when graph compilation fails."""
 
 
+RUNTIME_PATH_SEPARATOR = "/"
+
+
+def _join_runtime_path(parts: Sequence[str]) -> str:
+    for segment in parts:
+        if RUNTIME_PATH_SEPARATOR in segment:
+            raise BuildError(
+                f"Node id '{segment}' cannot contain '{RUNTIME_PATH_SEPARATOR}' which is reserved for flattened paths"
+            )
+    return RUNTIME_PATH_SEPARATOR.join(parts)
+
+
 @dataclass
 class NodeInterface:
     inputs: Dict[str, List[Tuple[str, str]]]
@@ -201,7 +213,7 @@ def _expand_graph(
             )
 
         if entry_template is not None:
-            flat_id = "__".join(path)
+            flat_id = _join_runtime_path(path)
             shell = NodeShell(
                 id=flat_id,
                 template=entry_template,
@@ -243,9 +255,11 @@ def _expand_graph(
         nodes.update(sub_nodes)
         edges.extend(sub_edges)
 
-        flat_prefix = "__".join(path)
+        flat_prefix_parts = list(path)
         shell_index.setdefault(path_key, []).extend(
-            node_name for node_name in sub_nodes if node_name.startswith(flat_prefix)
+            node_name
+            for node_name in sub_nodes
+            if node_name.split(RUNTIME_PATH_SEPARATOR)[: len(flat_prefix_parts)] == flat_prefix_parts
         )
 
         inputs_map: Dict[str, List[Tuple[str, str]]] = {}
@@ -260,7 +274,7 @@ def _expand_graph(
                 inner_node, inner_port = parse_endpoint(endpoint)
                 resolved.append(
                     (
-                        "__".join(path + (inner_node,)),
+                        _join_runtime_path(path + (inner_node,)),
                         inner_port,
                     )
                 )
@@ -270,7 +284,7 @@ def _expand_graph(
         for alias, endpoint in nested_spec.outputs.items():
             inner_node, inner_port = parse_endpoint(endpoint)
             outputs_map[alias] = (
-                "__".join(path + (inner_node,)),
+                _join_runtime_path(path + (inner_node,)),
                 inner_port,
             )
 

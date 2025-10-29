@@ -19,6 +19,8 @@ STATE_LABELS = {
     "unknown": "unknown",
 }
 
+RUNTIME_PATH_SEPARATOR = "/"
+
 
 @dataclass
 class SpecTreeNode:
@@ -181,7 +183,7 @@ class SpecInspector:
         path: Tuple[str, ...],
     ) -> SpecTreeNode:
         display_path = self._format_display_path(path)
-        runtime_id = "__".join(path)
+        runtime_id = RUNTIME_PATH_SEPARATOR.join(path)
         operator_ref = node_spec.operator
         return SpecTreeNode(
             name=path[-1],
@@ -393,7 +395,7 @@ class SpecInspector:
         raise KeyError(f"Unknown spec path '{path}'")
 
     def _normalize_relative_path(self, value: str) -> Optional[str]:
-        if "__" in value:
+        if RUNTIME_PATH_SEPARATOR in value:
             # runtime ids are handled elsewhere
             return None
         parts = tuple(part for part in value.split(".") if part)
