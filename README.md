@@ -132,23 +132,22 @@ The encoding preserves `ParameterRefValue` placeholders (`{"__dag_param__": "bia
 The text inspector preserves the hierarchy and annotates each node with its runtime state when a plan is available:
 
 ```python
-from dag.inspect_utils import render_spec_tree, render_spec_node
+from dag.inspect_utils import render_plan_tree, render_plan_node
 
-print(render_spec_tree(pipeline_spec, plan=runtime, root_name="PIPELINE"))
-print(render_spec_node(pipeline_spec, "scaled.node", plan=runtime, root_name="PIPELINE"))
+print(render_plan_tree(runtime, root_name="PIPELINE"))
+print(render_plan_node(runtime, "scaled.node", root_name="PIPELINE"))
 ```
 
 Example output:
 
 ```
 PIPELINE (graph) [computed]
-├── PIPELINE.helper [computed] <helper> :: add_pair
-├── PIPELINE.out [computed] <out> :: add_pair
-└── PIPELINE.scaled (graph) [computed]
-    └── PIPELINE.scaled.node [computed] <scaled__node> :: ScaleAndBias
-```
+|-- PIPELINE.helper [computed] <helper> :: add_pair
+|-- PIPELINE.out [computed] <out> :: add_pair
++-- PIPELINE.scaled (graph) [computed]
+    +-- PIPELINE.scaled.node [computed] <scaled/node> :: ScaleAndBias
 
-States are inferred from the plan's cache: `computed` (cache populated), `pending` (never evaluated), `partial` (cache disabled/cleared), `unknown` (mixed children). Use `render_spec_node(...)` to drill into configs, metadata, execution stats, and cache status for any path or runtime id.
+States are inferred from the plan's cache: `computed` (cache populated), `pending` (never evaluated), `partial` (cache disabled/cleared), `unknown` (mixed children). Use `render_plan_node(...)` to drill into configs, metadata, execution stats, and cache status for any path or runtime id.
 
 ---
 

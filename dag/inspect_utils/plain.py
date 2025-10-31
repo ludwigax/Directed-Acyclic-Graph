@@ -1,248 +1,247 @@
-"""Console-friendly inspection helpers for graph specs and execution plans."""
+"""Human-friendly console inspection for DAG plans."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Literal, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 from ..node import ExecutionPlan
-from ..core.ports import ParameterSpec
+from ..core.nodes import GraphTemplate, NodeShell
 from ..core.specs import GraphSpec, NodeSpec
 
-Serializable = Dict[str, Any]
-StateLiteral = Literal["computed", "pending", "partial", "unknown"]
+TreePath = Tuple[str, ...]
+PlanSource = Union[ExecutionPlan, GraphTemplate, GraphSpec]
 
-STATE_LABELS = {
-    "computed": "computed",
-    "pending": "pending",
-    "partial": "partial",
-    "unknown": "unknown",
-}
-
-RUNTIME_PATH_SEPARATOR = "/"
+ASCII_BRANCH_LAST = "+-- "
+ASCII_BRANCH_MID = "|-- "
+ASCII_PIPE_LAST = "    "
+ASCII_PIPE_MID = "|   "
+RUNTIME_SEP = "/"
 
 
 @dataclass
-class SpecTreeNode:
-    """Tree node representing either a graph or a runnable node."""
-
+class TreeNode:
     name: str
-    kind: Literal["graph", "node"]
-    path: Tuple[str, ...]
+    path: TreePath
+    kind: str  # "graph" | "node"
     display_path: str
     runtime_id: Optional[str]
-    node_spec: Optional[NodeSpec]
-    graph_spec: Optional[GraphSpec]
-    operator_ref: Any
-    node_config: Mapping[str, Any]
-    node_metadata: Mapping[str, Any]
-    graph_metadata: Mapping[str, Any]
-    parameters: Mapping[str, ParameterSpec]
-    inputs: Mapping[str, Any]
-    outputs: Mapping[str, Any]
-    operator_name: Optional[str]
-    state: StateLiteral = "pending"
-    children: List["SpecTreeNode"] = field(default_factory=list)
+    node_spec: Optional[NodeSpec] = None
+    node_shell: Optional[NodeShell] = None
+    graph_spec: Optional[GraphSpec] = None
+    operator_ref: Any = None
+    config: Mapping[str, Any] = field(default_factory=dict)
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+    graph_metadata: Mapping[str, Any] = field(default_factory=dict)
+    parameters: Mapping[str, Any] = field(default_factory=dict)
+    inputs: Mapping[str, Any] = field(default_factory=dict)
+    outputs: Mapping[str, Any] = field(default_factory=dict)
+    operator_name: Optional[str] = None
+    state: str = "pending"
+    children: List["TreeNode"] = field(default_factory=list)
 
 
 class SpecInspector:
-    """Interactive helper for exploring graph specs in text form."""
+    """Compact inspector for plans/specs with optional runtime state."""
 
     def __init__(
         self,
-        spec: GraphSpec,
+        source: PlanSource,
         *,
         plan: Optional[ExecutionPlan] = None,
         root_name: Optional[str] = None,
     ) -> None:
-        self.spec = spec
-        self.plan = plan
-        self.root_name = root_name or spec.metadata.get("name") or "Graph"
-        self.root = self._build_graph_node(
-            spec=spec,
-            prefix=(),
-            node_id=None,
-            node_spec=None,
-        )
-        self._nodes_by_display: Dict[str, SpecTreeNode] = {}
-        self._nodes_by_relative: Dict[str, SpecTreeNode] = {}
-        self._nodes_by_runtime: Dict[str, SpecTreeNode] = {}
-        self._register_node(self.root)
-        self._compute_states(self.root)
+        if isinstance(source, ExecutionPlan):
+            self.plan = source
+            self.template = source.template
+            self.spec = None
+            metadata = dict(self.template.metadata)
+        elif isinstance(source, GraphTemplate):
+            self.plan = plan
+            self.template = source
+            self.spec = None
+            metadata = dict(self.template.metadata)
+        else:
+            self.plan = plan
+            self.template = None
+            self.spec = source
+            metadata = dict(source.metadata)
+
+        self.root_name = root_name or metadata.get("name") or "Graph"
+        if self.template is not None:
+            self.root = self._build_template_tree(self.template)
+        else:
+            assert self.spec is not None
+            self.root = self._build_graph_tree(self.spec, prefix=())
+
+        self._display_index: Dict[str, TreeNode] = {}
+        self._relative_index: Dict[str, TreeNode] = {}
+        self._runtime_index: Dict[str, TreeNode] = {}
+        self._register(self.root)
+        self._annotate_states(self.root)
 
     # ------------------------------------------------------------------ #
     # Public API
     # ------------------------------------------------------------------ #
 
-    def render_tree(
-        self,
-        *,
-        show_runtime_ids: bool = True,
-    ) -> str:
-        """Render the spec tree as a text block."""
-        lines: List[str] = []
-        lines.append(self._format_node_label(self.root, show_runtime_ids))
-        for index, child in enumerate(self.root.children):
-            self._render_tree(
+    def render_tree(self, *, show_runtime_ids: bool = True) -> str:
+        lines: List[str] = [self._format_node_label(self.root, show_runtime_ids)]
+        for idx, child in enumerate(self.root.children):
+            self._render_subtree(
                 node=child,
                 lines=lines,
                 prefix="",
-                is_last=index == len(self.root.children) - 1,
+                is_last=idx == len(self.root.children) - 1,
                 show_runtime_ids=show_runtime_ids,
             )
         return "\n".join(lines)
 
-    def print_tree(
-        self,
-        *,
-        show_runtime_ids: bool = True,
-    ) -> None:
-        """Pretty-print the spec tree to stdout."""
-        print(self.render_tree(show_runtime_ids=show_runtime_ids))
-
-    def list_paths(self) -> List[str]:
-        """Return all known spec paths (relative to the root)."""
-        paths = [
-            path for path in self._nodes_by_relative.keys() if path
-        ]
-        return sorted(paths)
-
     def render_node(self, path: str) -> str:
-        """Render node details for the given path."""
-        node = self._locate(path)
+        node = self._resolve_path(path)
         return "\n".join(self._format_node_details(node))
 
-    def print_node(self, path: str) -> None:
-        """Pretty-print node details for the given path."""
-        print(self.render_node(path))
+    def resolve_paths(self) -> Sequence[str]:
+        return sorted(key for key in self._relative_index if key)
 
     # ------------------------------------------------------------------ #
-    # Tree building and bookkeeping
+    # Tree building helpers
     # ------------------------------------------------------------------ #
 
-    def _build_graph_node(
+    def _build_graph_tree(
         self,
-        *,
         spec: GraphSpec,
-        prefix: Tuple[str, ...],
-        node_id: Optional[str],
-        node_spec: Optional[NodeSpec],
-    ) -> SpecTreeNode:
-        if node_id is None:
-            path: Tuple[str, ...] = ()
-            name = self.root_name
-            display_path = self.root_name
-            node_metadata: Mapping[str, Any] = {}
-        else:
-            path = prefix + (node_id,)
-            name = node_id
-            display_path = self._format_display_path(path)
-            node_metadata = dict(node_spec.metadata) if node_spec else {}
-
-        node = SpecTreeNode(
-            name=name,
-            kind="graph",
+        *,
+        prefix: TreePath,
+        node_id: Optional[str] = None,
+        node_spec: Optional[NodeSpec] = None,
+    ) -> TreeNode:
+        path = prefix + ((node_id,) if node_id else ())
+        display_path = self._format_display_path(path)
+        node = TreeNode(
+            name=node_id or self.root_name,
             path=path,
+            kind="graph",
             display_path=display_path,
             runtime_id=None,
             node_spec=node_spec,
             graph_spec=spec,
             operator_ref=spec,
-            node_config=dict(node_spec.config) if node_spec else {},
-            node_metadata=node_metadata,
+            config=dict(node_spec.config) if node_spec else {},
+            metadata=dict(node_spec.metadata) if node_spec else {},
             graph_metadata=dict(spec.metadata),
             parameters=dict(spec.parameters),
             inputs=dict(spec.inputs),
             outputs=dict(spec.outputs),
-            operator_name=_resolve_graph_name(name, spec, node_spec),
+            operator_name=self._resolve_graph_name(node_id or self.root_name, spec, node_spec),
         )
-
         for child_id in sorted(spec.nodes.keys()):
             child_spec = spec.nodes[child_id]
-            operator_ref = child_spec.operator
-            if isinstance(operator_ref, GraphSpec):
-                child_node = self._build_graph_node(
-                    spec=operator_ref,
-                    prefix=path,
-                    node_id=child_id,
-                    node_spec=child_spec,
+            if isinstance(child_spec.operator, GraphSpec):
+                node.children.append(
+                    self._build_graph_tree(
+                        child_spec.operator,
+                        prefix=path,
+                        node_id=child_id,
+                        node_spec=child_spec,
+                    )
                 )
             else:
-                child_node = self._build_leaf_node(
-                    node_spec=child_spec,
-                    path=path + (child_id,),
-                )
-            node.children.append(child_node)
-
+                node.children.append(self._build_leaf_from_spec(child_spec, path + (child_id,)))
         return node
 
-    def _build_leaf_node(
-        self,
-        *,
-        node_spec: NodeSpec,
-        path: Tuple[str, ...],
-    ) -> SpecTreeNode:
-        display_path = self._format_display_path(path)
-        runtime_id = RUNTIME_PATH_SEPARATOR.join(path)
-        operator_ref = node_spec.operator
-        return SpecTreeNode(
+    def _build_leaf_from_spec(self, node_spec: NodeSpec, path: TreePath) -> TreeNode:
+        runtime_id = RUNTIME_SEP.join(path)
+        return TreeNode(
             name=path[-1],
-            kind="node",
             path=path,
-            display_path=display_path,
+            kind="node",
+            display_path=self._format_display_path(path),
             runtime_id=runtime_id,
             node_spec=node_spec,
-            graph_spec=None,
-            operator_ref=operator_ref,
-            node_config=dict(node_spec.config),
-            node_metadata=dict(node_spec.metadata),
-            graph_metadata={},
-            parameters={},
-            inputs={},
-            outputs={},
-            operator_name=_resolve_operator_name(operator_ref),
+            operator_ref=node_spec.operator,
+            config=dict(node_spec.config),
+            metadata=dict(node_spec.metadata),
+            operator_name=self._resolve_operator_name(node_spec.operator),
         )
 
-    def _register_node(self, node: SpecTreeNode) -> None:
-        self._nodes_by_display[node.display_path] = node
-        if node is self.root:
-            self._nodes_by_display[self.root_name] = node
-            self._nodes_by_relative[""] = node
-        else:
-            relative = ".".join(node.path)
-            self._nodes_by_relative[relative] = node
-        if node.runtime_id:
-            self._nodes_by_runtime[node.runtime_id] = node
-        for child in node.children:
-            self._register_node(child)
+    def _build_template_tree(self, template: GraphTemplate) -> TreeNode:
+        root = TreeNode(
+            name=self.root_name,
+            path=(),
+            kind="graph",
+            display_path=self.root_name,
+            runtime_id=None,
+            graph_metadata=dict(template.metadata),
+            parameters=dict(template.parameters),
+            inputs={alias: list(endpoints) for alias, endpoints in template.inputs.items()},
+            outputs=dict(template.outputs),
+        )
+
+        graph_nodes: Dict[str, TreeNode] = {"": root}
+        for path_key in sorted(template.shell_index.keys()):
+            parts = tuple(filter(None, path_key.split(".")))
+            if not parts:
+                continue
+            runtime_ids = template.shell_index[path_key]
+            prefix_id = RUNTIME_SEP.join(parts)
+            has_nested = any(rid != prefix_id for rid in runtime_ids)
+            if not has_nested:
+                continue
+            parent_key = ".".join(parts[:-1])
+            parent = graph_nodes.get(parent_key, root)
+            node_path = parent.path + (parts[-1],)
+            graph_node = TreeNode(
+                name=parts[-1],
+                path=node_path,
+                kind="graph",
+                display_path=self._format_display_path(node_path),
+                runtime_id=None,
+            )
+            parent.children.append(graph_node)
+            graph_nodes[path_key] = graph_node
+
+        for runtime_id, shell in sorted(template.nodes.items()):
+            segments = tuple(filter(None, runtime_id.split(RUNTIME_SEP)))
+            parent = graph_nodes.get(".".join(segments[:-1]), root)
+            node_path = parent.path + (segments[-1],)
+            parent.children.append(
+                TreeNode(
+                    name=segments[-1],
+                    path=node_path,
+                    kind="node",
+                    display_path=self._format_display_path(node_path),
+                    runtime_id=runtime_id,
+                    node_shell=shell,
+                    operator_ref=shell.template,
+                    config=dict(shell.config),
+                    metadata=dict(shell.metadata),
+                    operator_name=self._resolve_operator_name(shell.template),
+                )
+            )
+        return root
 
     # ------------------------------------------------------------------ #
     # State computation
     # ------------------------------------------------------------------ #
 
-    def _compute_states(self, node: SpecTreeNode) -> StateLiteral:
+    def _annotate_states(self, node: TreeNode) -> str:
         if node.kind == "node":
             node.state = self._leaf_state(node)
             return node.state
-
-        child_states = [self._compute_states(child) for child in node.children]
+        child_states = [self._annotate_states(child) for child in node.children]
         if not child_states:
             node.state = "pending"
-            return node.state
-
-        if all(state == "computed" for state in child_states):
+        elif all(state == "computed" for state in child_states):
             node.state = "computed"
         elif all(state == "pending" for state in child_states):
             node.state = "pending"
-        elif any(state == "computed" for state in child_states) or any(
-            state == "partial" for state in child_states
-        ):
+        elif any(state == "computed" for state in child_states):
             node.state = "partial"
         else:
-            node.state = "unknown"
+            node.state = "partial"
         return node.state
 
-    def _leaf_state(self, node: SpecTreeNode) -> StateLiteral:
+    def _leaf_state(self, node: TreeNode) -> str:
         if not self.plan or not node.runtime_id:
             return "pending"
         runtime = self.plan.node_runtimes.get(node.runtime_id)
@@ -256,99 +255,88 @@ class SpecInspector:
         return "pending"
 
     # ------------------------------------------------------------------ #
-    # Rendering helpers
+    # Rendering
     # ------------------------------------------------------------------ #
 
-    def _render_tree(
+    def _render_subtree(
         self,
         *,
-        node: SpecTreeNode,
+        node: TreeNode,
         lines: List[str],
         prefix: str,
         is_last: bool,
         show_runtime_ids: bool,
     ) -> None:
-        branch = "└── " if is_last else "├── "
-        lines.append(
-            f"{prefix}{branch}{self._format_node_label(node, show_runtime_ids)}"
-        )
-        child_prefix = f"{prefix}{'    ' if is_last else '│   '}"
-        for index, child in enumerate(node.children):
-            self._render_tree(
+        branch = ASCII_BRANCH_LAST if is_last else ASCII_BRANCH_MID
+        lines.append(f"{prefix}{branch}{self._format_node_label(node, show_runtime_ids)}")
+        child_prefix = f"{prefix}{ASCII_PIPE_LAST if is_last else ASCII_PIPE_MID}"
+        for idx, child in enumerate(node.children):
+            self._render_subtree(
                 node=child,
                 lines=lines,
                 prefix=child_prefix,
-                is_last=index == len(node.children) - 1,
+                is_last=idx == len(node.children) - 1,
                 show_runtime_ids=show_runtime_ids,
             )
 
-    def _format_node_label(
-        self,
-        node: SpecTreeNode,
-        show_runtime_ids: bool,
-    ) -> str:
-        state_label = STATE_LABELS.get(node.state, node.state)
+    def _format_node_label(self, node: TreeNode, show_runtime_ids: bool) -> str:
+        state = node.state
         if node.kind == "graph":
-            label = f"{node.display_path} (graph) [{state_label}]"
+            label = f"{node.display_path} (graph) [{state}]"
         else:
-            label = f"{node.display_path} [{state_label}]"
+            label = f"{node.display_path} [{state}]"
             if show_runtime_ids and node.runtime_id:
                 label += f" <{node.runtime_id}>"
             if node.operator_name:
                 label += f" :: {node.operator_name}"
         return label
 
-    def _format_node_details(self, node: SpecTreeNode) -> List[str]:
-        state_label = STATE_LABELS.get(node.state, node.state)
+    def _format_node_details(self, node: TreeNode) -> List[str]:
+        state = node.state
         lines: List[str] = []
         if node.kind == "graph":
             lines.append(f"Graph {node.display_path}")
-            lines.append(f"State: {state_label}")
-            if node.operator_name and node.operator_name != node.name:
-                lines.append(f"Display name: {node.operator_name}")
-            if node.node_config:
-                lines.append("Node configuration:")
-                lines.extend(_indent_lines(_format_mapping_lines(node.node_config)))
-            if node.node_metadata:
+            lines.append(f"State: {state}")
+            if node.node_spec and node.operator_name:
+                lines.append(f"Name: {node.operator_name}")
+            if node.config:
+                lines.append("Node config:")
+                lines.extend(self._indent_lines(self._format_mapping(node.config)))
+            if node.metadata:
                 lines.append("Node metadata:")
-                lines.extend(_indent_lines(_format_mapping_lines(node.node_metadata)))
+                lines.extend(self._indent_lines(self._format_mapping(node.metadata)))
             if node.graph_metadata:
                 lines.append("Graph metadata:")
-                lines.extend(_indent_lines(_format_mapping_lines(node.graph_metadata)))
+                lines.extend(self._indent_lines(self._format_mapping(node.graph_metadata)))
             if node.parameters:
                 lines.append("Parameters:")
-                lines.extend(_indent_lines(_format_parameters(node.parameters)))
+                lines.extend(self._indent_lines(self._format_parameters(node.parameters)))
             if node.inputs:
-                lines.append("Inputs (outline):")
-                lines.extend(_indent_lines(_format_endpoints(node.inputs)))
+                lines.append("Inputs:")
+                lines.extend(self._indent_lines(self._format_multi_endpoint(node.inputs)))
             if node.outputs:
-                lines.append("Outputs (outline):")
-                lines.extend(_indent_lines(_format_outputs(node.outputs)))
+                lines.append("Outputs:")
+                lines.extend(self._indent_lines(self._format_mapping(node.outputs)))
             if node.children:
                 lines.append("Children:")
                 for child in node.children:
-                    child_state = STATE_LABELS.get(child.state, child.state)
-                    suffix = ""
-                    if child.kind == "node" and child.operator_name:
-                        suffix = f" :: {child.operator_name}"
-                    lines.append(
-                        f"  - {child.display_path} ({'graph' if child.kind == 'graph' else 'node'}) [{child_state}]{suffix}"
-                    )
+                    suffix = f" :: {child.operator_name}" if (child.kind == "node" and child.operator_name) else ""
+                    lines.append(f"  - {child.display_path} ({child.kind}) [{child.state}]{suffix}")
         else:
             lines.append(f"Node {node.display_path}")
-            lines.append(f"State: {state_label}")
+            lines.append(f"State: {state}")
             if node.runtime_id:
                 lines.append(f"Runtime id: {node.runtime_id}")
             if node.operator_name:
                 lines.append(f"Operator: {node.operator_name}")
             if node.operator_ref is not None:
-                lines.append(f"Operator ref: {_describe_operator_ref(node.operator_ref)}")
-            if node.node_config:
+                lines.append(f"Operator ref: {self._describe_operator(node.operator_ref)}")
+            if node.config:
                 lines.append("Config:")
-                lines.extend(_indent_lines(_format_mapping_lines(node.node_config)))
-            if node.node_metadata:
+                lines.extend(self._indent_lines(self._format_mapping(node.config)))
+            if node.metadata:
                 lines.append("Metadata:")
-                lines.extend(_indent_lines(_format_mapping_lines(node.node_metadata)))
+                lines.extend(self._indent_lines(self._format_mapping(node.metadata)))
             if self.plan and node.runtime_id:
                 runtime = self.plan.node_runtimes.get(node.runtime_id)
                 if runtime:
@@ -361,92 +349,156 @@ class SpecInspector:
                     )
                     cache_state = runtime.get_cached()
                     cache_label = "valid" if cache_state is not None else "empty"
-                    lines.append(
-                        f"Cache: {cache_label} (enabled: {'yes' if runtime.cache_enabled else 'no'})"
-                    )
+                    lines.append(f"Cache: {cache_label} (enabled: {'yes' if runtime.cache_enabled else 'no'})")
         return lines
 
     # ------------------------------------------------------------------ #
-    # Lookup helpers
+    # Indexing / resolution
     # ------------------------------------------------------------------ #
 
-    def _locate(self, path: str) -> SpecTreeNode:
-        key = (path or "").strip()
-        if not key:
+    def _register(self, node: TreeNode) -> None:
+        self._display_index[node.display_path] = node
+        relative = ".".join(node.path)
+        self._relative_index[relative] = node
+        if node.runtime_id:
+            self._runtime_index[node.runtime_id] = node
+        for child in node.children:
+            self._register(child)
+
+    def _resolve_path(self, path: str) -> TreeNode:
+        query = path.strip()
+        if not query:
             return self.root
-
-        # Direct display path
-        node = self._nodes_by_display.get(key)
-        if node:
-            return node
-
-        # Relative dotted path
-        rel = self._normalize_relative_path(key)
-        if rel is not None:
-            node = self._nodes_by_relative.get(rel)
-            if node:
-                return node
-
-        # Runtime ID for leaves
-        node = self._nodes_by_runtime.get(key)
-        if node:
-            return node
-
-        raise KeyError(f"Unknown spec path '{path}'")
-
-    def _normalize_relative_path(self, value: str) -> Optional[str]:
-        if RUNTIME_PATH_SEPARATOR in value:
-            # runtime ids are handled elsewhere
-            return None
-        parts = tuple(part for part in value.split(".") if part)
-        if not parts:
-            return ""
-        if parts[0] == self.root_name:
+        if query in self._display_index:
+            return self._display_index[query]
+        if query in self._runtime_index:
+            return self._runtime_index[query]
+        parts = [part for part in query.split(".") if part]
+        if parts and parts[0] == self.root_name:
             parts = parts[1:]
-        return ".".join(parts)
+        normalized = ".".join(parts)
+        if normalized in self._relative_index:
+            return self._relative_index[normalized]
+        raise KeyError(f"Unknown node path '{path}'")
 
-    def _format_display_path(self, path: Tuple[str, ...]) -> str:
+    def _format_display_path(self, path: TreePath) -> str:
         if not path:
             return self.root_name
         return f"{self.root_name}." + ".".join(path)
 
+    # ------------------------------------------------------------------ #
+    # Formatting helpers
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _format_mapping(mapping: Mapping[str, Any]) -> List[str]:
+        if not mapping:
+            return ["<none>"]
+        return [f"{key}: {repr(value)}" for key, value in sorted(mapping.items())]
+
+    @staticmethod
+    def _format_multi_endpoint(mapping: Mapping[str, Any]) -> List[str]:
+        if not mapping:
+            return ["<none>"]
+        lines: List[str] = []
+        for key, value in sorted(mapping.items()):
+            if isinstance(value, (list, tuple, set)):
+                rendered = ", ".join(str(item) for item in value)
+            else:
+                rendered = str(value)
+            lines.append(f"{key}: {rendered}")
+        return lines
+
+    @staticmethod
+    def _format_parameters(parameters: Mapping[str, Any]) -> List[str]:
+        lines: List[str] = []
+        for name in sorted(parameters):
+            spec = parameters[name]
+            default = getattr(spec, "default", None)
+            required = getattr(spec, "required", False)
+            if required:
+                lines.append(f"{name}: <required>")
+            else:
+                lines.append(f"{name}: default={repr(default)}")
+        return lines or ["<none>"]
+
+    @staticmethod
+    def _indent_lines(lines: Iterable[str], indent: str = "  ") -> List[str]:
+        return [f"{indent}{line}" for line in lines]
+
+    @staticmethod
+    def _resolve_operator_name(operator_ref: Any) -> Optional[str]:
+        if operator_ref is None:
+            return None
+        if hasattr(operator_ref, "name"):
+            return getattr(operator_ref, "name")
+        if hasattr(operator_ref, "__name__"):
+            return operator_ref.__name__
+        if isinstance(operator_ref, str):
+            return operator_ref
+        return type(operator_ref).__name__
+
+    @staticmethod
+    def _resolve_graph_name(name: str, spec: GraphSpec, node_spec: Optional[NodeSpec]) -> str:
+        if node_spec and node_spec.metadata.get("name"):
+            return str(node_spec.metadata["name"])
+        if spec.metadata.get("name"):
+            return str(spec.metadata["name"])
+        return name
+
+    @staticmethod
+    def _describe_operator(operator_ref: Any) -> str:
+        if operator_ref is None:
+            return "<none>"
+        if isinstance(operator_ref, GraphSpec):
+            name = operator_ref.metadata.get("name") or "<graph>"
+            return f"GraphSpec(name={name})"
+        if hasattr(operator_ref, "name"):
+            return f"{type(operator_ref).__name__}(name={operator_ref.name})"
+        if hasattr(operator_ref, "__name__"):
+            return f"{type(operator_ref).__name__}::{operator_ref.__name__}"
+        return repr(operator_ref)
+
 
 # --------------------------------------------------------------------------- #
-# Convenience API
+# Convenience entry points
 # --------------------------------------------------------------------------- #
 
 
-def build_spec_inspector(
-    spec: GraphSpec,
+def inspect_plan(
+    source: PlanSource,
     *,
     plan: Optional[ExecutionPlan] = None,
     root_name: Optional[str] = None,
 ) -> SpecInspector:
-    """Construct a SpecInspector instance."""
-    return SpecInspector(spec, plan=plan, root_name=root_name)
+    """Build an inspector for a plan/spec/template."""
+    if isinstance(source, ExecutionPlan):
+        return SpecInspector(source, root_name=root_name)
+    return SpecInspector(source, plan=plan, root_name=root_name)
 
 
-def render_spec_tree(
-    spec: GraphSpec,
+def render_plan_tree(
+    source: PlanSource,
     *,
     plan: Optional[ExecutionPlan] = None,
     root_name: Optional[str] = None,
     show_runtime_ids: bool = True,
 ) -> str:
-    inspector = build_spec_inspector(spec, plan=plan, root_name=root_name)
-    return inspector.render_tree(show_runtime_ids=show_runtime_ids)
+    return inspect_plan(source, plan=plan, root_name=root_name).render_tree(
+        show_runtime_ids=show_runtime_ids
+    )
 
 
-def print_spec_tree(
-    spec: GraphSpec,
+def print_plan_tree(
+    source: PlanSource,
     *,
     plan: Optional[ExecutionPlan] = None,
     root_name: Optional[str] = None,
     show_runtime_ids: bool = True,
 ) -> None:
     print(
-        render_spec_tree(
-            spec,
+        render_plan_tree(
+            source,
             plan=plan,
             root_name=root_name,
             show_runtime_ids=show_runtime_ids,
@@ -454,249 +506,31 @@ def print_spec_tree(
     )
 
 
-def render_spec_node(
-    spec: GraphSpec,
+def render_plan_node(
+    source: PlanSource,
     path: str,
     *,
     plan: Optional[ExecutionPlan] = None,
     root_name: Optional[str] = None,
 ) -> str:
-    inspector = build_spec_inspector(spec, plan=plan, root_name=root_name)
-    return inspector.render_node(path)
+    return inspect_plan(source, plan=plan, root_name=root_name).render_node(path)
 
 
-def print_spec_node(
-    spec: GraphSpec,
+def print_plan_node(
+    source: PlanSource,
     path: str,
     *,
     plan: Optional[ExecutionPlan] = None,
     root_name: Optional[str] = None,
 ) -> None:
-    print(render_spec_node(spec, path, plan=plan, root_name=root_name))
-
-
-# --------------------------------------------------------------------------- #
-# Legacy runtime helpers (unchanged)
-# --------------------------------------------------------------------------- #
-
-
-def runtime_to_dict(plan: ExecutionPlan) -> Serializable:
-    """Convert an ExecutionPlan into a plain python dictionary."""
-    data = plan.describe()
-    data["topology"] = list(plan.topo_order)
-    return data
-
-
-def render_runtime_text(
-    plan: ExecutionPlan,
-    *,
-    indent: int = 0,
-    indent_step: int = 2,
-) -> str:
-    """Render an ExecutionPlan into a readable text block with indentation."""
-    graph_dict = runtime_to_dict(plan)
-    lines = _format_graph_dict(graph_dict, indent=indent, indent_step=indent_step)
-    return "\n".join(lines)
-
-
-def print_runtime(
-    plan: ExecutionPlan,
-    *,
-    indent: int = 0,
-    indent_step: int = 2,
-) -> None:
-    """Pretty-print an ExecutionPlan to stdout."""
-    print(render_runtime_text(plan, indent=indent, indent_step=indent_step))
-
-
-# --------------------------------------------------------------------------- #
-# Helper utilities
-# --------------------------------------------------------------------------- #
-
-
-def _resolve_operator_name(operator_ref: Any) -> Optional[str]:
-    if operator_ref is None:
-        return None
-    if hasattr(operator_ref, "name"):
-        return getattr(operator_ref, "name")
-    if hasattr(operator_ref, "__name__"):
-        return operator_ref.__name__
-    if isinstance(operator_ref, str):
-        return operator_ref
-    return type(operator_ref).__name__
-
-
-def _resolve_graph_name(
-    fallback: str,
-    spec: GraphSpec,
-    node_spec: Optional[NodeSpec],
-) -> str:
-    if node_spec and node_spec.metadata.get("name"):
-        return str(node_spec.metadata["name"])
-    if spec.metadata.get("name"):
-        return str(spec.metadata["name"])
-    return fallback
-
-
-def _describe_operator_ref(operator_ref: Any) -> str:
-    if operator_ref is None:
-        return "<none>"
-    if isinstance(operator_ref, GraphSpec):
-        name = operator_ref.metadata.get("name") or "<graph>"
-        return f"GraphSpec(name={name})"
-    if hasattr(operator_ref, "name"):
-        return f"{type(operator_ref).__name__}(name={operator_ref.name})"
-    if hasattr(operator_ref, "__name__"):
-        return f"{type(operator_ref).__name__}::{operator_ref.__name__}"
-    return repr(operator_ref)
-
-
-def _format_mapping(mapping: Mapping[str, Any]) -> str:
-    pairs = [f"{key}={repr(value)}" for key, value in sorted(mapping.items())]
-    return ", ".join(pairs) if pairs else "{}"
-
-
-def _format_mapping_lines(mapping: Mapping[str, Any]) -> List[str]:
-    if not mapping:
-        return ["<empty>"]
-    return [f"{key}: {repr(value)}" for key, value in sorted(mapping.items())]
-
-
-def _format_parameters(parameters: Mapping[str, ParameterSpec]) -> List[str]:
-    if not parameters:
-        return ["<none>"]
-    lines: List[str] = []
-    for name in sorted(parameters.keys()):
-        spec = parameters[name]
-        if spec.required:
-            lines.append(f"{name}: <required>")
-        else:
-            lines.append(f"{name}: default={repr(spec.default)}")
-    return lines
-
-
-def _format_endpoints(inputs: Mapping[str, Any]) -> List[str]:
-    if not inputs:
-        return ["<none>"]
-    lines: List[str] = []
-    for alias, endpoints in sorted(inputs.items()):
-        if isinstance(endpoints, (list, tuple, set)):
-            resolved = ", ".join(str(item) for item in endpoints)
-        else:
-            resolved = str(endpoints)
-        lines.append(f"{alias}: {resolved}")
-    return lines
-
-
-def _format_outputs(outputs: Mapping[str, Any]) -> List[str]:
-    if not outputs:
-        return ["<none>"]
-    lines: List[str] = []
-    for alias, endpoint in sorted(outputs.items()):
-        lines.append(f"{alias}: {endpoint}")
-    return lines
-
-
-def _indent_lines(lines: Iterable[str], *, indent: str = "  ") -> List[str]:
-    return [f"{indent}{line}" for line in lines]
-
-
-def _format_graph_dict(
-    graph_dict: Serializable,
-    *,
-    indent: int,
-    indent_step: int,
-) -> List[str]:
-    prefix = " " * indent
-    lines: List[str] = []
-
-    name = graph_dict.get("metadata", {}).get("name") or "<graph>"
-    lines.append(f"{prefix}Graph {name}")
-
-    metadata = graph_dict.get("metadata") or {}
-    if metadata:
-        lines.append(
-            f"{prefix}{' ' * indent_step}metadata: {_format_mapping(metadata)}"
-        )
-
-    inputs = graph_dict.get("inputs", {})
-    if inputs:
-        lines.append(f"{prefix}{' ' * indent_step}Inputs:")
-        for alias, endpoints in sorted(inputs.items()):
-            targets = ", ".join(endpoints)
-            lines.append(f"{prefix}{' ' * (2 * indent_step)}{alias} -> {targets}")
-
-    outputs = graph_dict.get("outputs", {})
-    if outputs:
-        lines.append(f"{prefix}{' ' * indent_step}Outputs:")
-        for alias, endpoint in sorted(outputs.items()):
-            lines.append(f"{prefix}{' ' * (2 * indent_step)}{alias} <- {endpoint}")
-
-    nodes = graph_dict.get("nodes", {})
-    if nodes:
-        lines.append(f"{prefix}{' ' * indent_step}Nodes:")
-        for node_id, info in sorted(nodes.items()):
-            lines.extend(
-                _format_node_runtime(
-                    node_id,
-                    info,
-                    indent=indent + 2 * indent_step,
-                    indent_step=indent_step,
-                )
-            )
-
-    topology = graph_dict.get("topology", [])
-    if topology:
-        lines.append(
-            f"{prefix}{' ' * indent_step}topological_order: {', '.join(topology)}"
-        )
-
-    return lines
-
-
-def _format_node_runtime(
-    node_id: str,
-    info: Mapping[str, Any],
-    *,
-    indent: int,
-    indent_step: int,
-) -> List[str]:
-    prefix = " " * indent
-    lines: List[str] = []
-
-    lines.append(f"{prefix}- {node_id} :: operator:{info.get('operator')}")
-
-    inputs = info.get("inputs", [])
-    if inputs:
-        lines.append(f"{prefix}{' ' * indent_step}inputs: {', '.join(inputs)}")
-
-    outputs = info.get("outputs", [])
-    if outputs:
-        lines.append(f"{prefix}{' ' * indent_step}outputs: {', '.join(outputs)}")
-
-    config = info.get("config", {})
-    if config:
-        lines.append(
-            f"{prefix}{' ' * indent_step}config: {_format_mapping(config)}"
-        )
-
-    metadata = info.get("metadata", {})
-    if metadata:
-        lines.append(
-            f"{prefix}{' ' * indent_step}metadata: {_format_mapping(metadata)}"
-        )
-
-    return lines
+    print(render_plan_node(source, path, plan=plan, root_name=root_name))
 
 
 __all__ = [
     "SpecInspector",
-    "build_spec_inspector",
-    "render_spec_tree",
-    "print_spec_tree",
-    "render_spec_node",
-    "print_spec_node",
-    "runtime_to_dict",
-    "render_runtime_text",
-    "print_runtime",
+    "inspect_plan",
+    "render_plan_tree",
+    "print_plan_tree",
+    "render_plan_node",
+    "print_plan_node",
 ]

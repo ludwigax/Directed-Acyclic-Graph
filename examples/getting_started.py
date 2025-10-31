@@ -27,7 +27,7 @@ if __package__ in (None, ""):
         sys.path.insert(0, str(PROJECT_ROOT))
 
 from dag.dsl import parse_dsl
-from dag.inspect_utils import render_spec_tree
+from dag.inspect_utils import render_plan_tree
 from dag.node import (
     GraphSpec,
     RegistrationError,
@@ -231,7 +231,7 @@ def run_basic_demo() -> None:
     print("\nRound-trip GraphSpec successful.")
 
     print("\nSpec tree for PIPELINE:")
-    print(render_spec_tree(pipeline_spec, plan=runtime, root_name="PIPELINE"))
+    print(render_plan_tree(runtime, root_name="PIPELINE"))
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +283,7 @@ def run_parallel_numpy_demo() -> None:
         print(f"Observed speed-up (plan): {speedup:.2f}x")
 
     print("\nSpec tree for NUMERIC_PIPELINE:")
-    print(render_spec_tree(numeric_spec, plan=plan, root_name="NUMERIC_PIPELINE"))
+    print(render_plan_tree(plan, root_name="NUMERIC_PIPELINE"))
 
 
 def main() -> None:

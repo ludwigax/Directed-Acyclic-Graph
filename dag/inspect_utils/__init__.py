@@ -2,26 +2,18 @@
 
 from .plain import (
     SpecInspector,
-    build_spec_inspector,
-    print_runtime,
-    print_spec_node,
-    print_spec_tree,
-    render_runtime_text,
-    render_spec_node,
-    render_spec_tree,
-    runtime_to_dict,
+    inspect_plan,
+    print_plan_node,
+    print_plan_tree,
+    render_plan_node,
+    render_plan_tree,
 )
-from .web import create_runtime_app
 
 __all__ = [
     "SpecInspector",
-    "build_spec_inspector",
-    "render_spec_tree",
-    "print_spec_tree",
-    "render_spec_node",
-    "print_spec_node",
-    "print_runtime",
-    "render_runtime_text",
-    "runtime_to_dict",
-    "create_runtime_app",
+    "inspect_plan",
+    "render_plan_tree",
+    "print_plan_tree",
+    "render_plan_node",
+    "print_plan_node",
 ]
